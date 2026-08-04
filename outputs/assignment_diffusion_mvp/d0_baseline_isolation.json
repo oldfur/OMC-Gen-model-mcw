@@ -1,0 +1,216 @@
+{
+  "mode": "full GemNet/DiffusionModule cross-worktree isolation",
+  "pass": true,
+  "checkpoint": {
+    "checkpoint_path": "/home/mcw/OMC-Gen-model-assignment-diffusion-mvp/outputs/assignment_diffusion_mvp/full_checkpoint_isolation/full_gemnet_initialized_baseline.pt",
+    "checkpoint_sha256": "da5b744b32c6befb8bf16593dda15a68376ff03e860bbfe70c95d000911145cf",
+    "kind": "full-model initialized checkpoint (not trained)",
+    "created_in_baseline_worktree": true,
+    "baseline_commit": "3830650861981a29851d2c1f5e472d52722247be",
+    "parameter_count": 46057338,
+    "state_dict_keys": 327,
+    "strict_load": {
+      "missing_keys": [],
+      "unexpected_keys": []
+    },
+    "source_trained_checkpoint": {
+      "path": "/home/mcw/OMC-Gen-model/outputs/molcsp_sinkhorn_short_diagnostic_preflight_2/checkpoints/diagnostic.ckpt",
+      "sha256": "1c98082dcb190b5929062efa9691b08c1732148ef2fcade7d1d35e2606ecef5d",
+      "state_dict_keys": 338,
+      "compatibility": "strict load rejected: 11 historical dynamic-assignment keys absent from both audited source trees"
+    },
+    "config": {
+      "_target_": "mattergen.diffusion.lightning_module.DiffusionLightningModule",
+      "optimizer_partial": {
+        "lr": 0.0001,
+        "_target_": "torch.optim.Adam",
+        "_partial_": true
+      },
+      "scheduler_partials": [
+        {
+          "scheduler": {
+            "_target_": "torch.optim.lr_scheduler.ReduceLROnPlateau",
+            "factor": 0.6,
+            "patience": 100,
+            "min_lr": 1e-06,
+            "verbose": true,
+            "_partial_": true
+          },
+          "interval": "epoch",
+          "frequency": 1,
+          "monitor": "loss_train",
+          "strict": true
+        }
+      ],
+      "diffusion_module": {
+        "_target_": "mattergen.diffusion.diffusion_module.DiffusionModule",
+        "model": {
+          "_target_": "mattergen.denoiser.GemNetTDenoiser",
+          "hidden_dim": 512,
+          "gemnet": {
+            "_target_": "mattergen.common.gemnet.gemnet.GemNetT",
+            "num_targets": 1,
+            "latent_dim": 512,
+            "atom_embedding": {
+              "_target_": "mattergen.common.gemnet.layers.embedding_block.AtomEmbedding",
+              "emb_size": 512,
+              "with_mask_type": false
+            },
+            "emb_size_atom": 512,
+            "emb_size_edge": 512,
+            "max_neighbors": 50,
+            "max_cell_images_per_dim": 5,
+            "cutoff": 7.0,
+            "num_blocks": 4,
+            "regress_stress": true,
+            "otf_graph": true,
+            "scale_file": "/home/mcw/OMC-Gen-model/mattergen/common/gemnet/gemnet-dT.json"
+          },
+          "molecule_conditioner": {
+            "_target_": "mattergen.common.gemnet.molecule_encoder.MolecularGraphConditioner",
+            "hidden_dim": 512,
+            "emb_dim": 256,
+            "num_layers": 4,
+            "dropout": 0.0,
+            "zero_init": true
+          },
+          "use_dynamic_sinkhorn_assignment": false,
+          "assignment_dim": 128,
+          "assignment_sinkhorn_iters": 20,
+          "assignment_tau_max": 1.0,
+          "assignment_tau_min": 0.05,
+          "assignment_tau_power": 1.0,
+          "assignment_role_scale": 0.01,
+          "assignment_dynamic_bond_scale": 0.1,
+          "assignment_debug_metrics": true,
+          "denoise_atom_types": false,
+          "atom_type_diffusion": "mask",
+          "property_embeddings_adapt": {},
+          "property_embeddings": {}
+        },
+        "corruption": {
+          "_target_": "mattergen.diffusion.corruption.multi_corruption.MultiCorruption",
+          "sdes": {
+            "pos": {
+              "_target_": "mattergen.common.diffusion.corruption.NumAtomsVarianceAdjustedWrappedVESDE",
+              "wrapping_boundary": 1.0,
+              "sigma_max": 5.0,
+              "limit_info_key": "num_atoms"
+            },
+            "cell": {
+              "_target_": "mattergen.common.diffusion.corruption.LatticeVPSDE.from_vpsde_config",
+              "vpsde_config": {
+                "beta_min": 0.1,
+                "beta_max": 20,
+                "limit_density": 0.1,
+                "limit_var_scaling_constant": 0.1
+              }
+            }
+          }
+        },
+        "loss_fn": {
+          "_target_": "mattergen.common.loss.MaterialsLoss",
+          "reduce": "mean",
+          "include_pos": true,
+          "include_cell": true,
+          "include_atomic_numbers": false,
+          "weights": {
+            "cell": 1.0,
+            "pos": 0.1
+          }
+        },
+        "pre_corruption_fn": {
+          "_target_": "mattergen.property_embeddings.SetEmbeddingType",
+          "p_unconditional": 0.2,
+          "dropout_fields_iid": false
+        }
+      }
+    }
+  },
+  "batches": [
+    {
+      "file": "batch_0.pt",
+      "structure_ids": [
+        "WIGXIU|2|press|dcf4bb9f4bea973",
+        "WIGXIU|2|press|97b75093ceb3ffd"
+      ],
+      "N": [
+        46,
+        46
+      ],
+      "Z": [
+        2,
+        2
+      ],
+      "M": [
+        23,
+        23
+      ]
+    },
+    {
+      "file": "batch_1.pt",
+      "structure_ids": [
+        "AKOVOL01|4|press|42a0040ce80c4b0",
+        "AKOVOL01|4|gener|1710cf527ac435a"
+      ],
+      "N": [
+        48,
+        48
+      ],
+      "Z": [
+        4,
+        4
+      ],
+      "M": [
+        12,
+        12
+      ]
+    },
+    {
+      "file": "batch_2.pt",
+      "structure_ids": [
+        "GEYMOM|4|press|c2ce6f47ed4d57b",
+        "KIMNAV|4|press|2c70501533c9135"
+      ],
+      "N": [
+        32,
+        44
+      ],
+      "Z": [
+        2,
+        4
+      ],
+      "M": [
+        16,
+        11
+      ]
+    }
+  ],
+  "eval": {
+    "tensor_count": 42,
+    "max_abs": 0.0,
+    "max_rel": 0.0
+  },
+  "train": {
+    "forward_tensor_count": 42,
+    "gradient_tensor_count": 648,
+    "forward_max_abs": 0.0,
+    "gradient_max_abs": 0.0,
+    "gradient_max_rel": 0.0
+  },
+  "rng": {
+    "all_equal": true
+  },
+  "disabled_assignment": {
+    "instantiated": false,
+    "trajectory": false,
+    "loss_key": false,
+    "parameters": []
+  },
+  "optimizer": {
+    "groups_equal": true,
+    "state_dict_keys_equal": true,
+    "group_count": 1,
+    "parameter_count": 46057338
+  }
+}

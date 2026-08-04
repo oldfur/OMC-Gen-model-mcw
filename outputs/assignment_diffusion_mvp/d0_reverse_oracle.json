@@ -1,0 +1,132 @@
+{
+  "oracle_cases": [
+    {
+      "dtype": "float32",
+      "block": "single_block",
+      "t": 1,
+      "x0_reconstruction_max_error": 1.4901161193847656e-08,
+      "posterior_mean_max_error": 1.4901161193847656e-08,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 1.4901161193847656e-08,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float32",
+      "block": "single_block",
+      "t": 8,
+      "x0_reconstruction_max_error": 5.960464477539063e-08,
+      "posterior_mean_max_error": 1.4901161193847656e-08,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 2.9802322387695312e-08,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float32",
+      "block": "single_block",
+      "t": 15,
+      "x0_reconstruction_max_error": 1.4901161193847656e-08,
+      "posterior_mean_max_error": 0.0,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 2.9802322387695312e-08,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float32",
+      "block": "multi_element_blocks",
+      "t": 1,
+      "x0_reconstruction_max_error": 8.568167686462402e-08,
+      "posterior_mean_max_error": 5.960464477539063e-08,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 3.725290298461914e-09,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float32",
+      "block": "multi_element_blocks",
+      "t": 8,
+      "x0_reconstruction_max_error": 5.960464477539063e-08,
+      "posterior_mean_max_error": 5.587935447692871e-09,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 5.960464477539063e-08,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float32",
+      "block": "multi_element_blocks",
+      "t": 15,
+      "x0_reconstruction_max_error": 2.9802322387695312e-08,
+      "posterior_mean_max_error": 2.2351741790771484e-08,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 2.9802322387695312e-08,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float64",
+      "block": "single_block",
+      "t": 1,
+      "x0_reconstruction_max_error": 2.7755575615628914e-17,
+      "posterior_mean_max_error": 0.0,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 2.7755575615628914e-17,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float64",
+      "block": "single_block",
+      "t": 8,
+      "x0_reconstruction_max_error": 0.0,
+      "posterior_mean_max_error": 0.0,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 5.551115123125783e-17,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float64",
+      "block": "single_block",
+      "t": 15,
+      "x0_reconstruction_max_error": 1.3877787807814457e-17,
+      "posterior_mean_max_error": 0.0,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 5.551115123125783e-17,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float64",
+      "block": "multi_element_blocks",
+      "t": 1,
+      "x0_reconstruction_max_error": 2.0816681711721685e-17,
+      "posterior_mean_max_error": 2.0816681711721685e-17,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 0.0,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float64",
+      "block": "multi_element_blocks",
+      "t": 8,
+      "x0_reconstruction_max_error": 1.1102230246251565e-16,
+      "posterior_mean_max_error": 1.1102230246251565e-16,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 2.7755575615628914e-17,
+      "forbidden_logit_max_abs": 0.0
+    },
+    {
+      "dtype": "float64",
+      "block": "multi_element_blocks",
+      "t": 15,
+      "x0_reconstruction_max_error": 1.1102230246251565e-16,
+      "posterior_mean_max_error": 4.0332320816460765e-17,
+      "posterior_variance_error": 0.0,
+      "gauge_residual": 1.3877787807814457e-17,
+      "forbidden_logit_max_abs": 0.0
+    }
+  ],
+  "empirical_posterior": {
+    "samples": 1024,
+    "mean_max_error": 0.0028918777165209963,
+    "covariance_max_error_vs_projected_posterior": 0.00023882462378817032,
+    "gauge_residual_max": 3.3306690738754696e-16,
+    "iid_identity_covariance_is_not_reference": true
+  },
+  "pass": true
+}

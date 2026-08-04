@@ -1,4 +1,13 @@
 _target_: mattergen.diffusion.diffusion_module.DiffusionModule
+assignment_diffusion_enabled: false
+assignment_diffusion_loss_weight: 1.0
+assignment_diffusion_steps: 1000
+assignment_clean_logit_scale: 8.0
+assignment_sinkhorn_tau_max: 1.0
+assignment_sinkhorn_tau_min: 0.10
+assignment_sinkhorn_max_iter: 300
+assignment_sinkhorn_tol: 1.0e-6
+assignment_prediction_type: epsilon
 model: mattergen
 corruption: csp
 

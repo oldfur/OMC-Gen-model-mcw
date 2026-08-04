@@ -31,6 +31,15 @@ class DiffusionModule(torch.nn.Module, Generic[T]):
         loss_fn: Loss,
         pre_corruption_fn: BatchTransform | None = None,
         timestep_sampler: TimestepSampler | None = None,
+        assignment_diffusion_enabled: bool = False,
+        assignment_diffusion_loss_weight: float = 1.0,
+        assignment_diffusion_steps: int = 1000,
+        assignment_clean_logit_scale: float = 8.0,
+        assignment_sinkhorn_tau_max: float = 1.0,
+        assignment_sinkhorn_tau_min: float = 0.10,
+        assignment_sinkhorn_max_iter: int = 300,
+        assignment_sinkhorn_tol: float = 1e-6,
+        assignment_prediction_type: str = "epsilon",
     ) -> None:
         super().__init__()
         self.model = model
@@ -43,6 +52,13 @@ class DiffusionModule(torch.nn.Module, Generic[T]):
             min_t=1e-5,
             max_t=corruption.T,
         )
+        self.assignment_diffusion_enabled = assignment_diffusion_enabled
+        self.assignment_diffusion_loss_weight = assignment_diffusion_loss_weight
+        if assignment_diffusion_enabled:
+            from mattergen.common.assignment_diffusion import AssignmentDiffusion
+            self.assignment_diffusion = AssignmentDiffusion(steps=assignment_diffusion_steps, clean_logit_scale=assignment_clean_logit_scale, tau_max=assignment_sinkhorn_tau_max, tau_min=assignment_sinkhorn_tau_min, sinkhorn_max_iter=assignment_sinkhorn_max_iter, sinkhorn_tol=assignment_sinkhorn_tol, prediction_type=assignment_prediction_type)
+        else:
+            self.assignment_diffusion = None
 
         # Check corruption for nn.Modules and register them here.
         self._register_corruption_modules()
@@ -87,6 +103,10 @@ class DiffusionModule(torch.nn.Module, Generic[T]):
             t=t,
             node_is_unmasked=node_is_unmasked,
         )
+        if self.assignment_diffusion is not None:
+            assignment_loss, marginal_error = self.assignment_diffusion.loss(batch, t)
+            loss = loss + self.assignment_diffusion_loss_weight * assignment_loss
+            metrics = {**metrics, "assignment_diffusion_loss": assignment_loss.detach(), "assignment_diffusion_marginal_error": marginal_error.detach()}
         assert loss.numel() == 1
 
         return loss, metrics

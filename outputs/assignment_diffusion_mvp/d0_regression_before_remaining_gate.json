@@ -1,0 +1,54 @@
+{
+  "seed": 20260804,
+  "command": "PYTHONPATH=. /home/mcw/miniconda3/envs/omg/bin/python scripts/diagnostics/assignment_diffusion_gate_a.py",
+  "pre_modification_reference": {
+    "status": "UNAVAILABLE",
+    "attempt": "python scripts/diagnostics/assignment_diffusion_d0.py",
+    "actual_exception": "ModuleNotFoundError: No module named 'torch'",
+    "reason": "The required interpreter was discovered only after the requested pre-edit command failed."
+  },
+  "post_implementation_regression": {
+    "status": "EXECUTED",
+    "samples": [
+      {
+        "sample_id": "WIGXIU|2|press|dcf4bb9f4bea973",
+        "N": 46,
+        "M": 23,
+        "Z": 2,
+        "strict_permutation": true,
+        "canonical_role_columns_independent_of_slot_order": true,
+        "copy_gauge_changes_only_copy_blocks": true
+      },
+      {
+        "sample_id": "WIGXIU|2|press|97b75093ceb3ffd",
+        "N": 46,
+        "M": 23,
+        "Z": 2,
+        "strict_permutation": true,
+        "canonical_role_columns_independent_of_slot_order": true,
+        "copy_gauge_changes_only_copy_blocks": true
+      }
+    ]
+  },
+  "samples": [
+    {
+      "sample_id": "WIGXIU|2|press|dcf4bb9f4bea973",
+      "N": 46,
+      "M": 23,
+      "Z": 2,
+      "strict_permutation": true,
+      "canonical_role_columns_independent_of_slot_order": true,
+      "copy_gauge_changes_only_copy_blocks": true
+    },
+    {
+      "sample_id": "WIGXIU|2|press|97b75093ceb3ffd",
+      "N": 46,
+      "M": 23,
+      "Z": 2,
+      "strict_permutation": true,
+      "canonical_role_columns_independent_of_slot_order": true,
+      "copy_gauge_changes_only_copy_blocks": true
+    }
+  ],
+  "pass": true
+}

@@ -1,0 +1,15 @@
+defaults:
+  - molcsp_le50_scratch
+  - _self_
+
+lightning_module:
+  diffusion_module:
+    assignment_diffusion_enabled: true
+    assignment_diffusion_loss_weight: 1.0
+    assignment_diffusion_steps: 1000
+    assignment_clean_logit_scale: 8.0
+    assignment_sinkhorn_tau_max: 1.0
+    assignment_sinkhorn_tau_min: 0.10
+    assignment_sinkhorn_max_iter: 300
+    assignment_sinkhorn_tol: 1.0e-6
+    assignment_prediction_type: epsilon

@@ -1,0 +1,97 @@
+{
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "predictor": {
+    "inputs": {
+      "L_t": [
+        46,
+        46
+      ],
+      "crystal_atomic_numbers": [
+        46
+      ],
+      "role_atomic_numbers": [
+        46
+      ],
+      "role_degree": [
+        46
+      ],
+      "crystal_pos": [
+        46,
+        3
+      ],
+      "cell": [
+        3,
+        3
+      ],
+      "element_mask": [
+        46,
+        46
+      ]
+    },
+    "flatten_matrix": false,
+    "row_or_column_slot_embedding": false,
+    "copy_index": false,
+    "canonical_role_index_embedding": false,
+    "layers": [
+      "atom/geometry row encoder",
+      "atom/role-degree column encoder",
+      "Sinkhorn weighted column aggregate",
+      "entrywise MLP"
+    ],
+    "expressivity_note": "It is equivariant but uses only a column aggregate plus entrywise MLP; D1 must assess identifiability/expressivity."
+  },
+  "errors": {
+    "row": {
+      "max": 1.7881393432617188e-07,
+      "mean": 1.5385448932647704e-07,
+      "p95": 1.7881393432617188e-07
+    },
+    "column": {
+      "max": 1.1920928955078125e-07,
+      "mean": 1.084059476852417e-07,
+      "p95": 1.1920928955078125e-07
+    },
+    "joint": {
+      "max": 1.7881393432617188e-07,
+      "mean": 1.5385448932647704e-07,
+      "p95": 1.7881393432617188e-07
+    },
+    "copy": {
+      "max": 1.1920928955078125e-07,
+      "mean": 5.3644180297851564e-08,
+      "p95": 1.1920928955078125e-07
+    },
+    "batch": {
+      "max": 0.0,
+      "mean": 0.0,
+      "p95": 0.0
+    },
+    "batch_independence": {
+      "max": 0.0,
+      "mean": 0.0,
+      "p95": 0.0
+    }
+  },
+  "pass": true
+}

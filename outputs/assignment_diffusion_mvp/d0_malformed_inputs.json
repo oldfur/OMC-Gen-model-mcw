@@ -1,0 +1,155 @@
+{
+  "cases": [
+    {
+      "test_name": "missing_mol_copy_id",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: missing mol_copy_id",
+      "pass": true
+    },
+    {
+      "test_name": "missing_mol_atom_id",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: missing mol_atom_id",
+      "pass": true
+    },
+    {
+      "test_name": "node_count_offsets_mismatch",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: packed batch index length 91 != node count 92",
+      "pass": true
+    },
+    {
+      "test_name": "nonmonotonic_batch_index",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: batch index is non-monotonic",
+      "pass": true
+    },
+    {
+      "test_name": "batch_index_out_of_range",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: batch index is non-contiguous or out of range",
+      "pass": true
+    },
+    {
+      "test_name": "illegal_copy_id",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: sample 0 mol_copy_id must be exactly [0, Z)",
+      "pass": true
+    },
+    {
+      "test_name": "missing_role",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: sample 0 copy 0 is missing a canonical role",
+      "pass": true
+    },
+    {
+      "test_name": "duplicate_role",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: sample 0 copy 0 is missing a canonical role",
+      "pass": true
+    },
+    {
+      "test_name": "inconsistent_role_sets",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: sample 0 copy 1 is missing a canonical role",
+      "pass": true
+    },
+    {
+      "test_name": "inconsistent_elements",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: sample 0 copy 1 has different element composition by role",
+      "pass": true
+    },
+    {
+      "test_name": "N_not_Z_times_M",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: sample 0 copy 0 has wrong role count",
+      "pass": true
+    },
+    {
+      "test_name": "target_graph_node_count_not_M",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: sample 0 target molecular graph node count != M (999 != 23)",
+      "pass": true
+    },
+    {
+      "test_name": "element_mask_empty_row",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: assignment mask has empty row/column",
+      "pass": true
+    },
+    {
+      "test_name": "element_mask_empty_column",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: assignment mask has empty row/column",
+      "pass": true
+    },
+    {
+      "test_name": "assignment_column_count_mismatch",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: sample 0 target molecular graph node count != M (999 != 23)",
+      "pass": true
+    },
+    {
+      "test_name": "role_id_out_of_range",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: sample 0 mol_atom_id must be exactly [0, M)",
+      "pass": true
+    },
+    {
+      "test_name": "copy_id_float",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: mol_copy_id must have integer dtype, got torch.float32",
+      "pass": true
+    },
+    {
+      "test_name": "role_id_float",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: mol_atom_id must have integer dtype, got torch.float32",
+      "pass": true
+    },
+    {
+      "test_name": "empty_sample",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: batch index is non-contiguous or out of range",
+      "pass": true
+    },
+    {
+      "test_name": "entire_batch_empty",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: entire batch is empty",
+      "pass": true
+    },
+    {
+      "test_name": "nan_coordinates",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: coordinates contain NaN or Inf",
+      "pass": true
+    },
+    {
+      "test_name": "inf_coordinates",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: coordinates contain NaN or Inf",
+      "pass": true
+    },
+    {
+      "test_name": "nan_logits",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: logits contain NaN or Inf",
+      "pass": true
+    },
+    {
+      "test_name": "inf_logits",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: logits contain NaN or Inf",
+      "pass": true
+    },
+    {
+      "test_name": "cross_sample_bond",
+      "expected_exception": "ValueError",
+      "actual_exception": "ValueError: invalid packed assignment input: mol_bond_edge_index crosses packed samples",
+      "pass": true
+    }
+  ],
+  "pass": true
+}

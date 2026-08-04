@@ -1,0 +1,97 @@
+{
+  "seed": 20260804,
+  "expected_projector_rank": 5,
+  "projector_cases": [
+    {
+      "dtype": "float32",
+      "shape": [
+        6,
+        6
+      ],
+      "allowed": 14,
+      "rank": 5,
+      "row_residual": 5.960464477539063e-08,
+      "column_residual": 0.0,
+      "idempotence": 0.0,
+      "covariance_max_error": 0.02899077534675598,
+      "mean_max_abs": 0.0187616478651762
+    },
+    {
+      "dtype": "float64",
+      "shape": [
+        6,
+        6
+      ],
+      "allowed": 14,
+      "rank": 5,
+      "row_residual": 2.0816681711721685e-17,
+      "column_residual": 2.7755575615628914e-17,
+      "idempotence": 0.0,
+      "covariance_max_error": 0.014704237016405997,
+      "mean_max_abs": 0.012313234499725788
+    }
+  ],
+  "forward_endpoints": [
+    {
+      "t": 0,
+      "reconstruction_error": 3.647804260253906e-05,
+      "eps_residual": 5.960464477539063e-08,
+      "lt_residual": 4.76837158203125e-07,
+      "signal_norm": 27.711429595947266,
+      "noise_norm": 0.017993345856666565,
+      "entropy": 1.0917412964772666e-06,
+      "sinkhorn_error": 0.0,
+      "forbidden_mass": 0.0
+    },
+    {
+      "t": 1,
+      "reconstruction_error": 1.0468065738677979e-05,
+      "eps_residual": 2.9802322387695312e-08,
+      "lt_residual": 4.76837158203125e-07,
+      "signal_norm": 27.691654205322266,
+      "noise_norm": 0.0690474733710289,
+      "entropy": 1.1254048786213389e-06,
+      "sinkhorn_error": 0.0,
+      "forbidden_mass": 0.0
+    },
+    {
+      "t": 4,
+      "reconstruction_error": 3.4570693969726562e-06,
+      "eps_residual": 1.1920928955078125e-07,
+      "lt_residual": 4.76837158203125e-07,
+      "signal_norm": 27.522329330444336,
+      "noise_norm": 0.5351213216781616,
+      "entropy": 1.2264823681107373e-06,
+      "sinkhorn_error": 1.1920928955078125e-07,
+      "forbidden_mass": 0.0
+    },
+    {
+      "t": 8,
+      "reconstruction_error": 1.4677643775939941e-06,
+      "eps_residual": 3.725290298461914e-08,
+      "lt_residual": 9.5367431640625e-07,
+      "signal_norm": 27.044191360473633,
+      "noise_norm": 0.584354043006897,
+      "entropy": 1.7684087652014568e-06,
+      "sinkhorn_error": 0.0,
+      "forbidden_mass": 0.0
+    },
+    {
+      "t": 15,
+      "reconstruction_error": 1.0132789611816406e-06,
+      "eps_residual": 0.0,
+      "lt_residual": 4.76837158203125e-07,
+      "signal_norm": 25.557619094848633,
+      "noise_norm": 0.9751102328300476,
+      "entropy": 4.282866484572878e-06,
+      "sinkhorn_error": 1.1920928955078125e-07,
+      "forbidden_mass": 0.0
+    }
+  ],
+  "row_column_equivariance_error": 0.0,
+  "gauge_shift_sinkhorn_error": 2.9802322387695312e-08,
+  "reverse_fixed_seed_error": 0.0,
+  "reverse_different_seed_difference": 0.485912024974823,
+  "reverse_final_error": 0.0,
+  "reverse_steps": 16
+}
