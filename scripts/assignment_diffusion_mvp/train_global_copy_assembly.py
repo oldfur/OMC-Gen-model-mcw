@@ -56,10 +56,12 @@ def move_sample_tensors(sample: dict, device: torch.device) -> dict:
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument("--config",type=Path,required=True);parser.add_argument("--steps",type=int,required=True);parser.add_argument("--execute",action="store_true",help="required safety acknowledgement; this command is not run by the implementation turn")
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument("--config",type=Path,required=True);parser.add_argument("--steps",type=int,required=True);parser.add_argument("--output-dir",type=Path,default=None,help="optional run directory; avoids overwriting a prior diagnostic trace");parser.add_argument("--execute",action="store_true",help="required safety acknowledgement; this command is not run by the implementation turn")
     args=parser.parse_args()
     if not args.execute: raise SystemExit("Refusing to train without --execute")
     cfg,sample,target,tree,model=load_setup(args.config)
+    if args.output_dir is not None:
+        cfg["output_dir"]=str(args.output_dir)
     device=resolve_device(str(cfg.get("device","auto")))
     sample=move_sample_tensors(sample,device);target=move_target(target,device);model=model.to(device)
     optimizer=torch.optim.AdamW(model.parameters(),lr=float(cfg.get("learning_rate",5e-5)),weight_decay=float(cfg.get("weight_decay",1e-4)))
