@@ -7,6 +7,7 @@ import torch
 
 from mattergen.assignment.global_copy_assembly.decoder import decode_copy_assembly
 from mattergen.assignment.global_copy_assembly.metrics import projected_molecular_bonds
+from mattergen.assignment.global_copy_assembly.module import GlobalStructuredCopyAssembly
 from mattergen.assignment.global_copy_assembly.pair_potential import permutation_factor
 from mattergen.assignment.global_copy_assembly.permutations import compose, enumerate_permutations, identity_index, inverse_permutations
 from mattergen.assignment.global_copy_assembly.targets import build_assembly_target, permutations_to_group, target_state_indices, validate_uniform_batch_k
@@ -58,6 +59,19 @@ def test_oracle_pair_scores_recover_C_and_projected_graph():
 
 def test_copy_label_gauge_leaves_C_invariant():
     target,_,_=synthetic_target();G=permutations_to_group(target);sigma=torch.tensor([1,0]);assert torch.equal(G@G.T,(G[:,sigma])@(G[:,sigma]).T)
+
+
+def test_bond_type_lookup_accepts_consistent_bidirectional_bond():
+    edges=torch.tensor([[9,1],[1,9]])
+    bond_types=torch.tensor([1,1])
+    assert GlobalStructuredCopyAssembly._bond_type(edges,bond_types,9,1)==1
+
+
+def test_bond_type_lookup_rejects_inconsistent_duplicate_bond():
+    edges=torch.tensor([[9,1],[1,9]])
+    bond_types=torch.tensor([1,2])
+    with pytest.raises(ValueError,match="inconsistent molecular bond types"):
+        GlobalStructuredCopyAssembly._bond_type(edges,bond_types,9,1)
 
 
 def test_non_bijective_decoded_permutation_fails_loudly():

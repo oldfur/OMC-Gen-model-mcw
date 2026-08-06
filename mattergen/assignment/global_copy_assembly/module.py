@@ -53,8 +53,14 @@ class GlobalStructuredCopyAssembly(nn.Module):
     def _bond_type(edge_index: torch.Tensor,bond_type: torch.Tensor,left:int,right:int)->int:
         matches=((edge_index[0]==left)&(edge_index[1]==right))|((edge_index[0]==right)&(edge_index[1]==left))
         found=bond_type[matches]
-        if len(found)!=1: raise ValueError(f"tree edge ({left},{right}) has no unique molecular bond type")
-        return int(found.item())
+        if found.numel()==0:
+            raise ValueError(f"tree edge ({left},{right}) has no molecular bond type")
+        unique_types=torch.unique(found)
+        if unique_types.numel()!=1:
+            raise ValueError(f"tree edge ({left},{right}) has inconsistent molecular bond types")
+        # Molecular graphs commonly carry both directions of an undirected bond.
+        # Duplicate entries are valid only when they agree on the bond type.
+        return int(unique_types.item())
 
     def select_tree(self, role_orbits:list[list[int]], edge_index:torch.Tensor, *, M:int)->MolecularTree:
         if self.config.anchor_policy!="highest_degree_singleton" or self.config.tree_policy!="bfs_from_anchor": raise ValueError("unsupported anchor/tree policy")
