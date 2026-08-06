@@ -1,0 +1,29 @@
+# Standalone diagnostic configuration.  It is not included by any main Hydra
+# config and therefore cannot activate assignment functionality implicitly.
+global_copy_assembly:
+  enabled: true
+  mode: clean_geometry_oracle_r
+  parameterization: role_permutation_tree_crf
+  fixed_sample_id: RHODIN01|4|gener|9b810e76ec9d286
+  split: val
+  fixed_sample_path: outputs/assignment_diffusion_mvp/d1_fixed_clean_geometry/fixed_sample.pt
+  automorphism_orbits_path: outputs/assignment_diffusion_mvp/role_automorphism_audit/role_orbits.json
+  output_dir: outputs/assignment_diffusion_mvp/global_copy_assembly_clean_oracle_r
+  anchor_policy: highest_degree_singleton
+  anchor_role: null
+  tree_policy: bfs_from_anchor
+  crystal_hidden_dim: 256
+  crystal_num_layers: 4
+  molecular_hidden_dim: 256
+  pair_hidden_dim: 256
+  distance_rbf_dim: 32
+  tree_nll_weight: 1.0
+  pair_ce_weight: 0.1
+  geometry_mode: correct_geometry
+  use_oracle_role_assignment: true
+  use_oracle_copy_relation: false
+  use_copy_id_as_input: false
+  strict_finite_checks: true
+  strict_shape_checks: true
+  checkpoint_monitor: val/projected_bond_f1
+  checkpoint_tie_break: val/copy_pair_f1

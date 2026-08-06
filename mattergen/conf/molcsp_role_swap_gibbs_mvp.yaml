@@ -1,0 +1,11 @@
+defaults:
+  - molcsp_le50_scratch
+  - _self_
+
+lightning_module:
+  diffusion_module:
+    assignment_latent_mode: role_partition
+    role_partition_diffusion_type: discrete_constrained
+    role_diffusion_type: swap_gibbs
+    matching_diffusion_type: masked_permutation
+    role_context_mode: geometry_only

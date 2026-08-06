@@ -1,5 +1,12 @@
 _target_: mattergen.diffusion.diffusion_module.DiffusionModule
 assignment_diffusion_enabled: false
+assignment_latent_mode: none
+role_partition_diffusion_type: discrete_constrained
+role_diffusion_type: masked_capacity
+matching_diffusion_type: masked_permutation
+role_context_mode: geometry_only
+global_copy_assembly:
+  enabled: false
 assignment_diffusion_loss_weight: 1.0
 assignment_diffusion_steps: 1000
 assignment_clean_logit_scale: 8.0

@@ -5,6 +5,8 @@ defaults:
 lightning_module:
   diffusion_module:
     assignment_diffusion_enabled: true
+    assignment_latent_mode: full_assignment
+    role_partition_diffusion_type: discrete_constrained
     assignment_diffusion_loss_weight: 1.0
     assignment_diffusion_steps: 1000
     assignment_clean_logit_scale: 8.0
