@@ -8,7 +8,7 @@ import torch
 from mattergen.assignment.global_copy_assembly.decoder import decode_copy_assembly
 from mattergen.assignment.global_copy_assembly.metrics import projected_molecular_bonds
 from mattergen.assignment.global_copy_assembly.module import GlobalStructuredCopyAssembly
-from mattergen.assignment.global_copy_assembly.pair_potential import permutation_factor
+from mattergen.assignment.global_copy_assembly.pair_potential import BondPairPotential, permutation_factor
 from mattergen.assignment.global_copy_assembly.permutations import compose, enumerate_permutations, identity_index, inverse_permutations
 from mattergen.assignment.global_copy_assembly.targets import build_assembly_target, permutations_to_group, target_state_indices, validate_uniform_batch_k
 from mattergen.assignment.global_copy_assembly.tree_builder import build_bfs_tree, select_anchor_role
@@ -46,6 +46,22 @@ def test_tree_crf_matches_bruteforce_and_has_finite_gradient():
     assert torch.allclose(crf.log_partition(factors),logz)
     decoded=crf.map_decode(factors);assert torch.allclose(decoded.score,best)
     target={0:crf.identity_state,1:0,2:1,3:0};loss=crf.nll(factors,target);loss.backward();assert all(torch.isfinite(x.grad).all() for x in factors.values())
+
+
+def test_tree_crf_nll_is_stable_under_large_per_edge_score_shifts():
+    tree=build_bfs_tree(torch.tensor([[0],[1]]),M=2,root=0);states=enumerate_permutations(2);crf=TreeCRF(tree,num_states=2,identity_state=identity_index(states));target={0:crf.identity_state,1:0}
+    base={(0,1):torch.tensor([[0.0,-3.0],[-2.0,1.0]],dtype=torch.float64,requires_grad=True)}
+    shifted={(0,1):base[(0,1)]+1.0e12}
+    base_nll=crf.nll(base,target);shifted_nll=crf.nll(shifted,target);logz,target_score=crf.log_partition_and_target_score(shifted,target)
+    assert torch.allclose(base_nll,shifted_nll,atol=1e-8)
+    assert shifted_nll >= 0 and target_score-logz <= 1e-10
+    shifted_nll.backward();assert torch.isfinite(base[(0,1)].grad).all()
+
+
+def test_bond_pair_potential_bounds_pair_scores():
+    potential=BondPairPotential(hidden=4,pair_hidden=8,rbf_dim=4,score_scale=3.0)
+    score=potential(torch.randn(2,4),torch.randn(2,4),torch.randn(4),torch.randn(4),1,torch.rand(2,3),torch.rand(2,3),torch.eye(3))
+    assert score.shape == (2,2) and score.abs().max() <= 3.0
 
 
 def test_oracle_pair_scores_recover_C_and_projected_graph():

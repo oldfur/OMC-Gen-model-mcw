@@ -17,8 +17,16 @@ global_copy_assembly:
   molecular_hidden_dim: 256
   pair_hidden_dim: 256
   distance_rbf_dim: 32
+  # Bounded pair energies and globally shifted factors avoid CRF cancellation.
+  pair_score_scale: 20.0
+  probability_tolerance: 1.0e-5
   tree_nll_weight: 1.0
   pair_ce_weight: 0.1
+  device: auto
+  learning_rate: 5.0e-5
+  weight_decay: 1.0e-4
+  gradient_clip_norm: 1.0
+  log_every_steps: 10
   geometry_mode: correct_geometry
   use_oracle_role_assignment: true
   use_oracle_copy_relation: false

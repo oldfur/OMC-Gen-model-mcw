@@ -28,8 +28,10 @@ class GlobalCopyAssemblyConfig:
     molecular_hidden_dim: int=256
     pair_hidden_dim: int=256
     distance_rbf_dim: int=32
+    pair_score_scale: float=20.0
     tree_nll_weight: float=1.0
     pair_ce_weight: float=0.1
+    probability_tolerance: float=1e-5
     use_oracle_role_assignment: bool=True
     use_oracle_copy_relation: bool=False
     use_copy_id_as_input: bool=False
@@ -47,7 +49,7 @@ class GlobalStructuredCopyAssembly(nn.Module):
         self.crystal_encoder=ContextCrystalEncoder(hidden=config.crystal_hidden_dim,layers=config.crystal_num_layers,rbf_dim=64)
         self.molecule_encoder=MolecularGraphEncoder(hidden=config.molecular_hidden_dim,layers=config.crystal_num_layers)
         if config.crystal_hidden_dim!=config.molecular_hidden_dim: raise ValueError("MVP requires matching crystal and molecular hidden dimensions")
-        self.pair_potential=BondPairPotential(hidden=config.crystal_hidden_dim,pair_hidden=config.pair_hidden_dim,rbf_dim=config.distance_rbf_dim)
+        self.pair_potential=BondPairPotential(hidden=config.crystal_hidden_dim,pair_hidden=config.pair_hidden_dim,rbf_dim=config.distance_rbf_dim,score_scale=config.pair_score_scale)
 
     @staticmethod
     def _bond_type(edge_index: torch.Tensor,bond_type: torch.Tensor,left:int,right:int)->int:
@@ -83,15 +85,26 @@ class GlobalStructuredCopyAssembly(nn.Module):
 
     def loss(self, *, target:AssemblyTarget, tree:MolecularTree, z:torch.Tensor, frac:torch.Tensor, cell:torch.Tensor, role_z:torch.Tensor, role_edge_index:torch.Tensor, role_bond_type:torch.Tensor) -> dict[str,torch.Tensor]:
         factors,states,scores=self.factors(target=target,tree=tree,z=z,frac=frac,cell=cell,role_z=role_z,role_edge_index=role_edge_index,role_bond_type=role_bond_type)
-        crf=TreeCRF(tree,num_states=len(states),identity_state=identity_index(states));target_states=target_state_indices(target,states);tree_nll=crf.nll(factors,target_states)
+        crf=TreeCRF(tree,num_states=len(states),identity_state=identity_index(states));target_states=target_state_indices(target,states)
+        log_z,target_score=crf.log_partition_and_target_score(factors,target_states)
+        tree_nll=(log_z-target_score)/max(1,len(tree.tree_edges))
         pair_losses=[]
         for parent,child in tree.tree_edges:
             p_parent,p_child=target.permutations[parent],target.permutations[child];inv_child=torch.empty_like(p_child);inv_child[p_child]=torch.arange(target.K,device=p_child.device);match=inv_child[p_parent]
             pair_losses.extend([nn.functional.cross_entropy(scores[(parent,child)],match),nn.functional.cross_entropy(scores[(parent,child)].T,torch.argsort(match))])
         pair_ce=torch.stack(pair_losses).mean() if pair_losses else tree_nll.new_zeros(())
+        target_log_probability=target_score-log_z
+        tolerance=self.config.probability_tolerance
+        if tree_nll.detach() < -tolerance:
+            raise FloatingPointError(f"tree NLL became negative beyond tolerance: {float(tree_nll.detach())}")
+        if target_log_probability.detach() > tolerance:
+            raise FloatingPointError(f"target log-probability became positive beyond tolerance: {float(target_log_probability.detach())}")
         total=self.config.tree_nll_weight*tree_nll+self.config.pair_ce_weight*pair_ce
-        log_z=crf.log_partition(factors);target_score=crf.target_score(factors,target_states)
-        return {"loss":total,"tree_nll":tree_nll,"pair_ce":pair_ce,"target_score":target_score,"log_partition":log_z,"target_log_probability":target_score-log_z}
+        if not torch.isfinite(total):
+            raise FloatingPointError("global copy-assembly loss is non-finite")
+        pair_score_absmax=torch.stack([score.detach().abs().amax() for score in scores.values()]).amax()
+        factor_absmax=torch.stack([factor.detach().abs().amax() for factor in factors.values()]).amax()
+        return {"loss":total,"tree_nll":tree_nll,"pair_ce":pair_ce,"target_score":target_score,"log_partition":log_z,"target_log_probability":target_log_probability,"pair_score_absmax":pair_score_absmax,"factor_absmax":factor_absmax}
 
     @torch.no_grad()
     def map_decode(self, *, target:AssemblyTarget, tree:MolecularTree, z:torch.Tensor, frac:torch.Tensor, cell:torch.Tensor, role_z:torch.Tensor, role_edge_index:torch.Tensor, role_bond_type:torch.Tensor) -> dict[str,object]:

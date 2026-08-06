@@ -12,11 +12,14 @@ class BondPairPotential(nn.Module):
     canonical-role index embedding.  Role identity is represented only by the
     permutation-equivariant molecular encoder output supplied as ``h_role``.
     """
-    def __init__(self, hidden: int = 256, pair_hidden: int | None = None, rbf_dim: int = 32, bond_types: int = 8, cutoff: float = 6.0):
+    def __init__(self, hidden: int = 256, pair_hidden: int | None = None, rbf_dim: int = 32, bond_types: int = 8, cutoff: float = 6.0, score_scale: float = 20.0):
         super().__init__()
+        if score_scale <= 0:
+            raise ValueError("pair score_scale must be positive")
         self.bond_embedding = nn.Embedding(bond_types, hidden)
         self.register_buffer("centres", torch.linspace(0, cutoff, rbf_dim))
         self.cutoff = cutoff
+        self.score_scale = float(score_scale)
         pair_hidden=hidden if pair_hidden is None else pair_hidden
         self.net = nn.Sequential(nn.Linear(8 * hidden + rbf_dim, pair_hidden), nn.SiLU(), nn.Linear(pair_hidden, pair_hidden), nn.SiLU(), nn.Linear(pair_hidden, 1))
 
@@ -32,7 +35,10 @@ class BondPairPotential(nn.Module):
         bond=self.bond_embedding(torch.as_tensor(bond_type,device=h_left.device).long().clamp(0,self.bond_embedding.num_embeddings-1)).view(1,1,-1).expand_as(left)
         roles=torch.cat([h_role_left,h_role_right],-1).view(1,1,-1).expand(len(h_left),len(h_right),-1)
         features=torch.cat([left,right,left+right,(left-right).abs(),left*right,roles,bond,rbf],-1)
-        return self.net(features).squeeze(-1)
+        # A bounded energy is sufficient for the K=4 exact-CRF MVP and keeps
+        # both the structured NLL and pair CE in a representable range.
+        raw_score=self.net(features).squeeze(-1)
+        return self.score_scale*torch.tanh(raw_score/self.score_scale)
 
 
 def permutation_factor(pair_score: torch.Tensor, permutations: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor:
