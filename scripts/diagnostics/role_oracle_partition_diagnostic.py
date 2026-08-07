@@ -19,9 +19,10 @@ from scipy.optimize import linear_sum_assignment
 from mattergen.common.role_partition_diffusion import OraclePartitionRoleDiagnostic, capacity_sinkhorn
 from mattergen.common.role_partition_diffusion.swap_gibbs import SwapGibbsRoleDiffusion, assert_legal
 
-OUT = Path("outputs/assignment_diffusion_mvp/role_oracle_partition_diagnostic")
-SAMPLE = Path("outputs/assignment_diffusion_mvp/d1_fixed_clean_geometry/fixed_sample.pt")
-AUT = Path("outputs/assignment_diffusion_mvp/role_automorphism_audit/molecular_automorphisms.json")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+OUT = ROOT_DIR / "outputs" / "assignment_diffusion_mvp" / "role_oracle_partition_diagnostic"
+SAMPLE = ROOT_DIR / "outputs" / "assignment_diffusion_mvp" / "d1_fixed_clean_geometry" / "fixed_sample.pt"
+AUT = ROOT_DIR / "outputs" / "assignment_diffusion_mvp" / "role_automorphism_audit" / "molecular_automorphisms.json"
 SEED = 17
 STEPS = int(os.environ.get("ORACLE_PARTITION_MAX_STEPS", "5000"))
 MODES = ("geometry_only", "oracle_same_copy", "oracle_copy_local")
@@ -36,6 +37,8 @@ def seed_all(seed: int) -> None:
 
 
 def load() -> dict:
+    if not SAMPLE.exists():
+        raise FileNotFoundError(f"fixed sample not found: {SAMPLE}")
     raw = torch.load(SAMPLE, map_location="cpu", weights_only=False)
     return {key: (value.cuda() if isinstance(value, torch.Tensor) else value) for key, value in raw.items()}
 
@@ -188,6 +191,8 @@ def train(mode: str, s: dict, states: list[torch.Tensor], perms: list[list[int]]
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True); (OUT / "logs").mkdir(exist_ok=True)
+    if not AUT.exists():
+        raise FileNotFoundError(f"automorphism artifact not found: {AUT}")
     seed_all(SEED); s = load(); states = terminal_states(s)
     perms = json.loads(AUT.read_text())["permutations"]
     if (int(s["N"]), int(s["M"]), int(s["Z"]), s["id"], s["split"]) != (40, 10, 4, "RHODIN01|4|gener|9b810e76ec9d286", "val"):
