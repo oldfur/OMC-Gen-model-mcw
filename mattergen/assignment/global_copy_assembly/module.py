@@ -19,6 +19,7 @@ from .decoder import decode_copy_assembly
 class GlobalCopyAssemblyConfig:
     enabled: bool=False
     mode: str="clean_geometry_oracle_r"
+    role_source: str="oracle_r0"
     parameterization: str="role_permutation_tree_crf"
     anchor_policy: str="highest_degree_singleton"
     anchor_role: int|None=None
@@ -43,8 +44,13 @@ class GlobalStructuredCopyAssembly(nn.Module):
     """Global tree-CRF copy assembly. Predictor forward has no copy-ID input."""
     def __init__(self, config: GlobalCopyAssemblyConfig=GlobalCopyAssemblyConfig()):
         super().__init__()
-        if config.mode!="clean_geometry_oracle_r" or config.parameterization!="role_permutation_tree_crf": raise ValueError("only clean_geometry_oracle_r / role_permutation_tree_crf is implemented")
-        if not config.use_oracle_role_assignment or config.use_oracle_copy_relation or config.use_copy_id_as_input: raise ValueError("this MVP requires oracle R only and forbids copy supervision as model input")
+        supported_modes={"clean_geometry_oracle_r","clean_geometry_predicted_r"}
+        if config.mode not in supported_modes or config.parameterization!="role_permutation_tree_crf": raise ValueError("only clean_geometry_oracle_r / clean_geometry_predicted_r with role_permutation_tree_crf are implemented")
+        if config.mode=="clean_geometry_predicted_r" and config.role_source!="geometry_only_hard_r": raise ValueError("geometry-only predicted-R mode requires role_source=geometry_only_hard_r")
+        if config.mode=="clean_geometry_oracle_r" and config.role_source not in {"oracle_r0","oracle_r0_hard_r"}: raise ValueError("oracle-R mode requires oracle_r0 role source")
+        if config.mode=="clean_geometry_oracle_r" and not config.use_oracle_role_assignment: raise ValueError("oracle-R mode requires use_oracle_role_assignment=true")
+        if config.mode=="clean_geometry_predicted_r" and config.use_oracle_role_assignment: raise ValueError("predicted-R mode requires use_oracle_role_assignment=false")
+        if config.use_oracle_copy_relation or config.use_copy_id_as_input: raise ValueError("this MVP forbids copy supervision as model input")
         self.config=config
         self.crystal_encoder=ContextCrystalEncoder(hidden=config.crystal_hidden_dim,layers=config.crystal_num_layers,rbf_dim=64)
         self.molecule_encoder=MolecularGraphEncoder(hidden=config.molecular_hidden_dim,layers=config.crystal_num_layers)
@@ -112,4 +118,5 @@ class GlobalStructuredCopyAssembly(nn.Module):
         crf=TreeCRF(tree,num_states=len(states),identity_state=identity_index(states));result=crf.map_decode(factors);G,C=decode_copy_assembly(target,states,result.state_indices)
         inverse=inverse_permutations(states)
         full_energy=sum((permutation_factor(score,states,inverse)[result.state_indices[edge[0]],result.state_indices[edge[1]]] for edge,score in scores.items()),start=result.score.new_zeros(()))
-        return {"state_indices":result.state_indices,"G":G,"C":C,"tree_energy":result.score,"full_molecular_edge_energy":full_energy,"status":"CLEAN_GEOMETRY_ORACLE_R_ONLY"}
+        status = "CLEAN_GEOMETRY_PREDICTED_R" if self.config.mode=="clean_geometry_predicted_r" else "CLEAN_GEOMETRY_ORACLE_R_ONLY"
+        return {"state_indices":result.state_indices,"G":G,"C":C,"tree_energy":result.score,"full_molecular_edge_energy":full_energy,"status":status}

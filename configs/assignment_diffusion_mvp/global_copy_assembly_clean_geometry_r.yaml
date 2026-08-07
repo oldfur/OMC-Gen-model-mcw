@@ -1,0 +1,12 @@
+global_copy_assembly:
+  enabled: true
+  mode: clean_geometry_predicted_r
+  role_source: geometry_only_hard_r
+  use_oracle_role_assignment: false
+  use_oracle_copy_relation: false
+  use_copy_id_as_input: false
+  fixed_sample_id: RHODIN01|4|gener|9b810e76ec9d286
+  split: val
+  seed: 17
+  steps: 5000
+  output_dir: outputs/assignment_diffusion_mvp/global_copy_assembly_geometry_r

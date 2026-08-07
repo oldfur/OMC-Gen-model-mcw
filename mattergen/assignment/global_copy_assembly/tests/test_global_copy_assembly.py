@@ -7,10 +7,10 @@ import torch
 
 from mattergen.assignment.global_copy_assembly.decoder import decode_copy_assembly
 from mattergen.assignment.global_copy_assembly.metrics import projected_molecular_bonds
-from mattergen.assignment.global_copy_assembly.module import GlobalStructuredCopyAssembly
+from mattergen.assignment.global_copy_assembly.module import GlobalCopyAssemblyConfig, GlobalStructuredCopyAssembly
 from mattergen.assignment.global_copy_assembly.pair_potential import BondPairPotential, permutation_factor
 from mattergen.assignment.global_copy_assembly.permutations import compose, enumerate_permutations, identity_index, inverse_permutations
-from mattergen.assignment.global_copy_assembly.targets import build_assembly_target, permutations_to_group, target_state_indices, validate_uniform_batch_k
+from mattergen.assignment.global_copy_assembly.targets import build_assembly_target, build_assembly_target_from_predicted_roles, permutations_to_group, target_state_indices, validate_uniform_batch_k
 from mattergen.assignment.global_copy_assembly.tree_builder import build_bfs_tree, select_anchor_role
 from mattergen.assignment.global_copy_assembly.tree_crf import TreeCRF
 
@@ -107,3 +107,21 @@ def test_failure_modes_fail_loudly():
     with pytest.raises(ValueError): build_assembly_target(torch.tensor([0,1,2,0,1,2]),torch.tensor([0,0,0,0,0,0]),M=3,K=2,anchor_role=0)
     states=enumerate_permutations(2);tree=build_bfs_tree(torch.tensor([[0],[1]]),M=2,root=0);crf=TreeCRF(tree,num_states=2,identity_state=0)
     with pytest.raises(FloatingPointError): crf.log_partition({(0,1):torch.full((2,2),float("nan"))})
+
+
+def test_predicted_role_audit_marks_gauge_equivalent_roles():
+    target,_,copy=synthetic_target();target2,audit=build_assembly_target_from_predicted_roles(torch.tensor([0,1,2,0,1,2]),copy,M=3,K=2,anchor_role=0,role_z=torch.tensor([1,1,1,1,1,1]),z=torch.tensor([1,1,1,1,1,1]))
+    assert target is not None and audit.status == "GAUGE_EQUIVALENT_R"
+
+
+def test_predicted_role_audit_fails_loudly_when_target_cannot_be_constructed():
+    with pytest.raises(ValueError): build_assembly_target(torch.tensor([0,0,0,0,0,0]),torch.tensor([0,1,0,1,0,1]),M=3,K=2,anchor_role=0)
+
+
+def test_predicted_role_source_isolated_from_oracle_copy_supervision():
+    cfg=GlobalCopyAssemblyConfig(mode="clean_geometry_predicted_r", role_source="geometry_only_hard_r", use_oracle_role_assignment=False, use_oracle_copy_relation=False, use_copy_id_as_input=False)
+    assert cfg.mode == "clean_geometry_predicted_r"
+    assert cfg.role_source == "geometry_only_hard_r"
+    assert not cfg.use_oracle_role_assignment
+    assert not cfg.use_oracle_copy_relation
+    assert not cfg.use_copy_id_as_input

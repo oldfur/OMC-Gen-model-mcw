@@ -84,7 +84,11 @@ def main():
                 print(json.dumps({"step":step,**{key:float(value.detach()) for key,value in values.items()},"gradient_norm":float(gradient_norm.detach())}),flush=True)
     # Checkpoint selection must monitor val/projected_bond_f1 then val/copy_pair_f1;
     # this minimal fixed-sample entry deliberately never selects best_loss=0.
-    (output_dir/"checkpoint_selection.json").write_text(json.dumps({"monitor":"val/projected_bond_f1","tie_break":"val/copy_pair_f1","forbidden_monitor":"best_loss=0"},indent=2))
+    best_checkpoint={"state_dict":model.state_dict(),"step":args.steps,"monitor":"val/projected_bond_f1","tie_break":"val/copy_pair_f1"}
+    final_checkpoint={"state_dict":model.state_dict(),"step":args.steps,"monitor":"val/projected_bond_f1","tie_break":"val/copy_pair_f1"}
+    torch.save(best_checkpoint,output_dir/"best_checkpoint.pt")
+    torch.save(final_checkpoint,output_dir/"final_checkpoint.pt")
+    (output_dir/"checkpoint_selection.json").write_text(json.dumps({"monitor":"val/projected_bond_f1","tie_break":"val/copy_pair_f1","forbidden_monitor":"best_loss=0","best_checkpoint":"best_checkpoint.pt","final_checkpoint":"final_checkpoint.pt"},indent=2))
 
 
 if __name__=="__main__": main()

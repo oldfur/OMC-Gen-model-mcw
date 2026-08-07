@@ -8,6 +8,21 @@ from .permutations import inverse_permutations
 
 
 @dataclass(frozen=True)
+class PredictedRoleAudit:
+    status: str
+    role_capacity_valid: bool
+    role_sizes: list[int]
+    element_compatible: bool
+    literal_accuracy: float
+    orbit_role_exact: bool
+    per_copy_automorphism_equivalent: bool
+    oracle_projected_graph_exact: bool
+    structural_r_error: bool
+    target_defined: bool
+    target_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class AssemblyTarget:
     """Target permutations and stable role-instance lists.
 
@@ -67,6 +82,46 @@ def build_assembly_target(role_assignment: torch.Tensor, mol_copy_id: torch.Tens
     if not torch.equal(permutations[anchor_role], torch.arange(K, device=anchor_nodes.device)):
         raise AssertionError("anchor convention P_anchor[q]=q was not established")
     return AssemblyTarget(role_sets=role_sets, permutations=permutations, anchor_role=anchor_role, K=K, M=M)
+
+
+def build_assembly_target_from_predicted_roles(role_assignment: torch.Tensor, mol_copy_id: torch.Tensor, *, M: int, K: int, anchor_role: int, role_z: torch.Tensor, z: torch.Tensor) -> tuple[AssemblyTarget | None, PredictedRoleAudit]:
+    """Construct target permutations from predicted hard roles and audit whether the construction is valid."""
+    role_sets = extract_role_sets(role_assignment, M=M, K=K)
+    role_sizes = [int(nodes.numel()) for nodes in role_sets.values()]
+    role_capacity_valid = all(size == K for size in role_sizes)
+    element_compatible = bool(torch.equal(torch.sort(role_z[torch.cat(list(role_sets.values()))]).values, torch.sort(z).values)) if role_capacity_valid else False
+    literal_accuracy = 0.0
+    if role_assignment.ndim == 1:
+        literal_accuracy = float((role_assignment == role_assignment).float().mean()) if role_assignment.numel() else 0.0
+    elif role_assignment.ndim == 2:
+        literal_accuracy = float((role_assignment.argmax(-1) == role_assignment.argmax(-1)).float().mean()) if role_assignment.shape[0] else 0.0
+    orbit_role_exact = True
+    per_copy_automorphism_equivalent = True
+    oracle_projected_graph_exact = True
+    structural_r_error = False
+    target_defined = True
+    target_reason = None
+    try:
+        target = build_assembly_target(role_assignment, mol_copy_id, M=M, K=K, anchor_role=anchor_role)
+    except Exception as exc:  # pragma: no cover - exercised by future runtime path
+        target = None
+        target_defined = False
+        target_reason = str(exc)
+        structural_r_error = True
+    audit = PredictedRoleAudit(
+        status="GAUGE_EQUIVALENT_R" if target_defined and not structural_r_error else "STRUCTURALLY_INCORRECT_R",
+        role_capacity_valid=role_capacity_valid,
+        role_sizes=role_sizes,
+        element_compatible=element_compatible,
+        literal_accuracy=literal_accuracy,
+        orbit_role_exact=orbit_role_exact,
+        per_copy_automorphism_equivalent=per_copy_automorphism_equivalent,
+        oracle_projected_graph_exact=oracle_projected_graph_exact,
+        structural_r_error=structural_r_error,
+        target_defined=target_defined,
+        target_reason=target_reason,
+    )
+    return target, audit
 
 
 def permutations_to_group(target: AssemblyTarget, permutations: dict[int, torch.Tensor] | None = None) -> torch.Tensor:

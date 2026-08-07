@@ -5,7 +5,7 @@ implements assignment diffusion nor calls the pos/cell denoiser.
 """
 
 from .module import GlobalCopyAssemblyConfig, GlobalStructuredCopyAssembly
-from .targets import AssemblyTarget, build_assembly_target, permutations_to_group, validate_uniform_batch_k
+from .targets import AssemblyTarget, PredictedRoleAudit, build_assembly_target, build_assembly_target_from_predicted_roles, permutations_to_group, validate_uniform_batch_k
 from .tree_crf import TreeCRF
 
-__all__ = ["AssemblyTarget", "GlobalCopyAssemblyConfig", "GlobalStructuredCopyAssembly", "TreeCRF", "build_assembly_target", "permutations_to_group", "validate_uniform_batch_k"]
+__all__ = ["AssemblyTarget", "GlobalCopyAssemblyConfig", "GlobalStructuredCopyAssembly", "PredictedRoleAudit", "TreeCRF", "build_assembly_target", "build_assembly_target_from_predicted_roles", "permutations_to_group", "validate_uniform_batch_k"]
