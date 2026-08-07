@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -18,11 +19,11 @@ if str(ROOT_DIR) not in sys.path:
 from mattergen.common.role_partition_diffusion import OraclePartitionRoleDiagnostic, capacity_sinkhorn
 from mattergen.common.role_partition_diffusion.swap_gibbs import SwapGibbsRoleDiffusion, assert_legal
 
-ROOT = Path("outputs/assignment_diffusion_mvp")
+ROOT = ROOT_DIR / "outputs" / "assignment_diffusion_mvp"
 SAMPLE_PATH = ROOT / "d1_fixed_clean_geometry" / "fixed_sample.pt"
-CHECKPOINT_PATH = ROOT / "role_oracle_partition_diagnostic" / "checkpoints" / "geometry_only" / "best.pt"
+CHECKPOINT_PATH = Path(os.environ.get("GEOMETRY_ONLY_CHECKPOINT_PATH", str(ROOT / "role_oracle_partition_diagnostic" / "checkpoints" / "geometry_only" / "best.pt")))
 ORBIT_PATH = ROOT / "role_automorphism_audit" / "role_orbits.json"
-OUTPUT = Path("outputs/assignment_diffusion_mvp/global_copy_assembly_geometry_r")
+OUTPUT = ROOT / "global_copy_assembly_geometry_r"
 OUTPUT.mkdir(parents=True, exist_ok=True)
 SEED = 17
 
@@ -94,6 +95,8 @@ def hungarian_capacity(scores: torch.Tensor, sample: dict) -> torch.Tensor:
 
 def load_model() -> tuple[OraclePartitionRoleDiagnostic, torch.device]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not CHECKPOINT_PATH.exists():
+        raise FileNotFoundError(f"geometry-only checkpoint not found: {CHECKPOINT_PATH}\nRun the diagnostic training step first or set GEOMETRY_ONLY_CHECKPOINT_PATH.")
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
     model = OraclePartitionRoleDiagnostic(context_mode="geometry_only").to(device)
     model.load_state_dict(checkpoint["state_dict"])

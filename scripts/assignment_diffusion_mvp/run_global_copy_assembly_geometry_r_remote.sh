@@ -25,6 +25,7 @@ if [[ "$EXECUTE" != "true" ]]; then
 fi
 
 python -m pytest mattergen/assignment/global_copy_assembly/tests/test_global_copy_assembly.py
+python scripts/diagnostics/role_oracle_partition_diagnostic.py
 python scripts/assignment_diffusion_mvp/export_geometry_only_hard_r.py
 python scripts/assignment_diffusion_mvp/audit_geometry_only_hard_r.py
 python scripts/assignment_diffusion_mvp/train_global_copy_assembly.py --config configs/assignment_diffusion_mvp/global_copy_assembly_clean_geometry_r.yaml --steps 5000 --output-dir outputs/assignment_diffusion_mvp/global_copy_assembly_geometry_r --execute
