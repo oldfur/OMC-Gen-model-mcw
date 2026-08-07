@@ -84,30 +84,77 @@ def build_assembly_target(role_assignment: torch.Tensor, mol_copy_id: torch.Tens
     return AssemblyTarget(role_sets=role_sets, permutations=permutations, anchor_role=anchor_role, K=K, M=M)
 
 
-def build_assembly_target_from_predicted_roles(role_assignment: torch.Tensor, mol_copy_id: torch.Tensor, *, M: int, K: int, anchor_role: int, role_z: torch.Tensor, z: torch.Tensor) -> tuple[AssemblyTarget | None, PredictedRoleAudit]:
-    """Construct target permutations from predicted hard roles and audit whether the construction is valid."""
-    role_sets = extract_role_sets(role_assignment, M=M, K=K)
-    role_sizes = [int(nodes.numel()) for nodes in role_sets.values()]
-    role_capacity_valid = all(size == K for size in role_sizes)
-    element_compatible = bool(torch.equal(torch.sort(role_z[torch.cat(list(role_sets.values()))]).values, torch.sort(z).values)) if role_capacity_valid else False
+def build_assembly_target_from_predicted_roles(
+    role_assignment: torch.Tensor,
+    mol_copy_id: torch.Tensor,
+    *,
+    M: int,
+    K: int,
+    anchor_role: int,
+    role_z: torch.Tensor,
+    z: torch.Tensor,
+    oracle_role: torch.Tensor | None = None,
+) -> tuple[AssemblyTarget | None, PredictedRoleAudit]:
+    """Construct target permutations from predicted hard roles and audit whether the construction is valid.
+
+    ``role_z`` is the molecular role element table with shape ``[M]``.
+    Predicted role labels (shape ``[N]``) index into ``role_z``; crystal atom
+    indices from role sets must never be used to index ``role_z``.
+    """
+    labels = _role_labels(role_assignment)
+    if role_z.ndim != 1 or int(role_z.numel()) != M:
+        raise ValueError(f"role_z must have shape [M={M}], got shape {tuple(role_z.shape)}")
+    if z.ndim != 1 or int(z.numel()) != int(labels.numel()):
+        raise ValueError(f"z must have shape [N={labels.numel()}], got shape {tuple(z.shape)}")
+
+    # Soft role-set extraction so capacity failures become audit flags instead of
+    # uncaught exceptions before structural classification.
+    role_sets_soft = {
+        role: (labels == role).nonzero(as_tuple=False).flatten().sort().values for role in range(M)
+    }
+    role_sizes = [int(role_sets_soft[role].numel()) for role in range(M)]
+    in_range = bool(labels.numel() > 0 and int(labels.min()) >= 0 and int(labels.max()) < M)
+    role_capacity_valid = bool(
+        in_range and labels.numel() == M * K and all(size == K for size in role_sizes)
+    )
+    # Element hard-mask: atom i with predicted role r must satisfy z[i] == role_z[r].
+    # Index role_z with role labels, never with crystal atom indices.
+    element_compatible = bool(torch.equal(z, role_z[labels])) if in_range else False
+
     literal_accuracy = 0.0
-    if role_assignment.ndim == 1:
-        literal_accuracy = float((role_assignment == role_assignment).float().mean()) if role_assignment.numel() else 0.0
-    elif role_assignment.ndim == 2:
-        literal_accuracy = float((role_assignment.argmax(-1) == role_assignment.argmax(-1)).float().mean()) if role_assignment.shape[0] else 0.0
-    orbit_role_exact = True
-    per_copy_automorphism_equivalent = True
-    oracle_projected_graph_exact = True
+    if oracle_role is not None:
+        oracle_labels = _role_labels(oracle_role)
+        if oracle_labels.shape == labels.shape:
+            literal_accuracy = float((labels == oracle_labels).float().mean())
+
+    # Orbit / automorphism / projected-graph fields require external side tables;
+    # structural validity for assembly is decided solely by whether P* builds.
+    orbit_role_exact = False
+    per_copy_automorphism_equivalent = False
+    oracle_projected_graph_exact = False
     structural_r_error = False
-    target_defined = True
-    target_reason = None
+    target_defined = False
+    target_reason: str | None = None
+    target: AssemblyTarget | None = None
     try:
         target = build_assembly_target(role_assignment, mol_copy_id, M=M, K=K, anchor_role=anchor_role)
-    except Exception as exc:  # pragma: no cover - exercised by future runtime path
+        target_defined = True
+    except Exception as exc:
         target = None
         target_defined = False
         target_reason = str(exc)
         structural_r_error = True
+
+    if target_defined and not element_compatible:
+        # A capacity-valid, copy-bijective R that still violates element pairing is
+        # a structural error for this MVP; do not silently train on it.
+        target = None
+        target_defined = False
+        structural_r_error = True
+        target_reason = "TARGET_UNDEFINED_DUE_TO_STRUCTURAL_R_ERROR: element-incompatible predicted role assignment"
+    elif not target_defined and target_reason is None:
+        target_reason = "TARGET_UNDEFINED_DUE_TO_STRUCTURAL_R_ERROR"
+
     audit = PredictedRoleAudit(
         status="GAUGE_EQUIVALENT_R" if target_defined and not structural_r_error else "STRUCTURALLY_INCORRECT_R",
         role_capacity_valid=role_capacity_valid,

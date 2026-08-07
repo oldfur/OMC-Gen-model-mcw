@@ -105,6 +105,7 @@ def main() -> None:
         anchor_role=0,
         role_z=sample["role_z"],
         z=sample["z"],
+        oracle_role=truth,
     )
     classification = "GAUGE_EQUIVALENT_R" if audit.target_defined and not audit.structural_r_error else "STRUCTURALLY_INCORRECT_R"
     payload = {

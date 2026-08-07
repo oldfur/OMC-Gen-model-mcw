@@ -110,8 +110,54 @@ def test_failure_modes_fail_loudly():
 
 
 def test_predicted_role_audit_marks_gauge_equivalent_roles():
-    target,_,copy=synthetic_target();target2,audit=build_assembly_target_from_predicted_roles(torch.tensor([0,1,2,0,1,2]),copy,M=3,K=2,anchor_role=0,role_z=torch.tensor([1,1,1,1,1,1]),z=torch.tensor([1,1,1,1,1,1]))
-    assert target is not None and audit.status == "GAUGE_EQUIVALENT_R"
+    target, _, copy = synthetic_target()
+    # role_z is the molecular table [M], never an atom-length vector.
+    target2, audit = build_assembly_target_from_predicted_roles(
+        torch.tensor([0, 1, 2, 0, 1, 2]),
+        copy,
+        M=3,
+        K=2,
+        anchor_role=0,
+        role_z=torch.tensor([1, 1, 1]),
+        z=torch.tensor([1, 1, 1, 1, 1, 1]),
+        oracle_role=torch.tensor([0, 1, 2, 0, 1, 2]),
+    )
+    assert target2 is not None and audit.status == "GAUGE_EQUIVALENT_R"
+    assert audit.element_compatible and audit.target_defined
+    assert audit.literal_accuracy == 1.0
+    G = permutations_to_group(target2)
+    assert torch.equal(G @ G.T, copy[:, None].eq(copy[None, :]).float())
+
+
+def test_predicted_role_element_check_indexes_role_z_by_role_labels_not_atom_ids():
+    """Regression: role_sets atom indices (e.g. 11) must not index role_z [M=10]."""
+    M, K, N = 10, 4, 40
+    role = torch.arange(N) % M
+    copy = torch.arange(N) // M
+    role_z = torch.arange(M) + 1
+    z = role_z[role]
+    # Atom index 11 appears in some role set; indexing role_z with atom ids would OOB.
+    assert int((role == 1).nonzero().flatten().max()) >= 11 or N > M
+    target, audit = build_assembly_target_from_predicted_roles(
+        role, copy, M=M, K=K, anchor_role=0, role_z=role_z, z=z, oracle_role=role
+    )
+    assert target is not None
+    assert audit.element_compatible
+    assert audit.target_defined
+    assert audit.status == "GAUGE_EQUIVALENT_R"
+
+
+def test_predicted_role_structural_capacity_error_is_audited_not_raised():
+    copy = torch.tensor([0, 1, 0, 1, 0, 1])
+    bad = torch.tensor([0, 0, 0, 0, 0, 0])
+    target, audit = build_assembly_target_from_predicted_roles(
+        bad, copy, M=3, K=2, anchor_role=0, role_z=torch.tensor([1, 1, 1]), z=torch.tensor([1, 1, 1, 1, 1, 1])
+    )
+    assert target is None
+    assert audit.structural_r_error
+    assert not audit.target_defined
+    assert audit.status == "STRUCTURALLY_INCORRECT_R"
+    assert not audit.role_capacity_valid
 
 
 def test_predicted_role_audit_fails_loudly_when_target_cannot_be_constructed():

@@ -39,17 +39,46 @@ def load_setup(config_path: Path):
     allowed={field.name for field in fields(GlobalCopyAssemblyConfig)}; model_cfg=GlobalCopyAssemblyConfig(**{key:value for key,value in cfg.items() if key in allowed})
     model=GlobalStructuredCopyAssembly(model_cfg);tree=model.select_tree(orbits,sample["role_edge_index"],M=int(sample["M"]))
     if model_cfg.mode == "clean_geometry_predicted_r":
+        if model_cfg.use_oracle_role_assignment or model_cfg.role_source != "geometry_only_hard_r":
+            raise RuntimeError(
+                "clean_geometry_predicted_r forbids oracle-R fallback: "
+                f"role_source={model_cfg.role_source!r}, use_oracle_role_assignment={model_cfg.use_oracle_role_assignment}"
+            )
         artifact_path = Path(cfg.get("predicted_role_artifact_path", root / "outputs/assignment_diffusion_mvp/global_copy_assembly_geometry_r/geometry_only_hard_r.jsonl"))
         if not artifact_path.exists():
             raise FileNotFoundError(f"predicted-role artifact missing: {artifact_path}")
-        artifact = json.loads(artifact_path.read_text())
+        lines = [json.loads(line) for line in artifact_path.read_text().splitlines() if line.strip()]
+        if not lines:
+            raise FileNotFoundError(f"predicted-role artifact is empty: {artifact_path}")
+        artifact = lines[-1]
+        if artifact.get("role_source") != "geometry_only_hard_r":
+            raise ValueError(f"artifact role_source must be geometry_only_hard_r, got {artifact.get('role_source')!r}")
+        if "role_assignment" not in artifact:
+            raise ValueError(f"predicted-role artifact missing role_assignment (stub/incomplete?): {artifact_path}")
         role_assignment = torch.tensor(artifact["role_assignment"], dtype=torch.long)
         if role_assignment.numel() != int(sample["N"]):
             raise ValueError("predicted-role artifact atom count mismatch")
-        target, audit = build_assembly_target_from_predicted_roles(role_assignment, sample["copy"], M=int(sample["M"]), K=int(sample["Z"]), anchor_role=tree.root, role_z=sample["role_z"], z=sample["z"])
+        # R_effective comes only from the geometry-only hard-R artifact; never sample["role"].
+        target, audit = build_assembly_target_from_predicted_roles(
+            role_assignment,
+            sample["copy"],
+            M=int(sample["M"]),
+            K=int(sample["Z"]),
+            anchor_role=tree.root,
+            role_z=sample["role_z"],
+            z=sample["z"],
+            oracle_role=sample["role"],
+        )
         if target is None or audit.structural_r_error:
             raise RuntimeError(f"predicted-role target construction failed: {audit}")
-        return cfg,sample,target,tree,model,audit
+        # Explicitly prove R_effective is the artifact, not oracle R0.
+        predicted_labels = role_assignment.long()
+        effective_labels = torch.empty(int(sample["N"]), dtype=torch.long)
+        for role, nodes in target.role_sets.items():
+            effective_labels[nodes] = int(role)
+        if not torch.equal(effective_labels, predicted_labels):
+            raise RuntimeError("R_effective from target.role_sets does not match geometry-only hard-R artifact")
+        return cfg, sample, target, tree, model, audit
     target=build_assembly_target(sample["role"],sample["copy"],M=int(sample["M"]),K=int(sample["Z"]),anchor_role=tree.root)
     return cfg,sample,target,tree,model,None
 
