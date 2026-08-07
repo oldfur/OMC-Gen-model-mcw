@@ -14,7 +14,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from mattergen.assignment.global_copy_assembly import AssemblyTarget, GlobalCopyAssemblyConfig, GlobalStructuredCopyAssembly, build_assembly_target
+from mattergen.assignment.global_copy_assembly import AssemblyTarget, GlobalCopyAssemblyConfig, GlobalStructuredCopyAssembly, build_assembly_target, build_assembly_target_from_predicted_roles
 
 
 def _resolve_path(cfg: dict, key: str, fallback: Path | None = None) -> Path:
@@ -38,8 +38,20 @@ def load_setup(config_path: Path):
     orbits=[value for _,value in sorted(orbit_json["role_orbits"].items(),key=lambda item:int(item[0]))]
     allowed={field.name for field in fields(GlobalCopyAssemblyConfig)}; model_cfg=GlobalCopyAssemblyConfig(**{key:value for key,value in cfg.items() if key in allowed})
     model=GlobalStructuredCopyAssembly(model_cfg);tree=model.select_tree(orbits,sample["role_edge_index"],M=int(sample["M"]))
+    if model_cfg.mode == "clean_geometry_predicted_r":
+        artifact_path = Path(cfg.get("predicted_role_artifact_path", root / "outputs/assignment_diffusion_mvp/global_copy_assembly_geometry_r/geometry_only_hard_r.jsonl"))
+        if not artifact_path.exists():
+            raise FileNotFoundError(f"predicted-role artifact missing: {artifact_path}")
+        artifact = json.loads(artifact_path.read_text())
+        role_assignment = torch.tensor(artifact["role_assignment"], dtype=torch.long)
+        if role_assignment.numel() != int(sample["N"]):
+            raise ValueError("predicted-role artifact atom count mismatch")
+        target, audit = build_assembly_target_from_predicted_roles(role_assignment, sample["copy"], M=int(sample["M"]), K=int(sample["Z"]), anchor_role=tree.root, role_z=sample["role_z"], z=sample["z"])
+        if target is None or audit.structural_r_error:
+            raise RuntimeError(f"predicted-role target construction failed: {audit}")
+        return cfg,sample,target,tree,model,audit
     target=build_assembly_target(sample["role"],sample["copy"],M=int(sample["M"]),K=int(sample["Z"]),anchor_role=tree.root)
-    return cfg,sample,target,tree,model
+    return cfg,sample,target,tree,model,None
 
 
 def training_step(model, target, tree, sample):
@@ -77,7 +89,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument("--config",type=Path,required=True);parser.add_argument("--steps",type=int,required=True);parser.add_argument("--output-dir",type=Path,default=None,help="optional run directory; avoids overwriting a prior diagnostic trace");parser.add_argument("--execute",action="store_true",help="required safety acknowledgement; this command is not run by the implementation turn")
     args=parser.parse_args()
     if not args.execute: raise SystemExit("Refusing to train without --execute")
-    cfg,sample,target,tree,model=load_setup(args.config)
+    cfg,sample,target,tree,model,role_audit=load_setup(args.config)
     if args.output_dir is not None:
         cfg["output_dir"]=str(args.output_dir)
     device=resolve_device(str(cfg.get("device","auto")))
@@ -87,7 +99,7 @@ def main():
     if gradient_clip_norm <= 0 or log_every_steps <= 0:
         raise ValueError("gradient_clip_norm and log_every_steps must be positive")
     output_dir=Path(cfg["output_dir"]);output_dir.mkdir(parents=True,exist_ok=True)
-    (output_dir/"config_audit.json").write_text(json.dumps({"status":"CLEAN_GEOMETRY_ORACLE_R_ONLY","use_copy_id_as_input":False,"use_oracle_copy_relation":False,"sample":sample["id"],"device":str(device),"learning_rate":optimizer.param_groups[0]["lr"],"gradient_clip_norm":gradient_clip_norm,"pair_score_scale":model.config.pair_score_scale},indent=2))
+    (output_dir/"config_audit.json").write_text(json.dumps({"status":"CLEAN_GEOMETRY_ORACLE_R_ONLY" if model.config.mode=="clean_geometry_oracle_r" else "CLEAN_GEOMETRY_PREDICTED_R","use_copy_id_as_input":False,"use_oracle_copy_relation":False,"sample":sample["id"],"device":str(device),"learning_rate":optimizer.param_groups[0]["lr"],"gradient_clip_norm":gradient_clip_norm,"pair_score_scale":model.config.pair_score_scale,"predicted_role_audit":None if role_audit is None else {"status": role_audit.status,"target_defined": role_audit.target_defined,"structural_r_error": role_audit.structural_r_error,"role_capacity_valid": role_audit.role_capacity_valid}},indent=2))
     (output_dir/"anchor_and_tree.json").write_text(json.dumps({"anchor":tree.root,"tree_edges":tree.tree_edges,"non_tree_edges":tree.non_tree_edges,"preorder":tree.preorder,"postorder":tree.postorder},indent=2))
     (output_dir/"permutation_convention.json").write_text(json.dumps({"convention":"P_r[q]=k: role-r instance q is assigned copy-gauge label k","anchor":"P_anchor[q]=q"},indent=2))
     print(json.dumps({"event":"training_start","device":str(device),"steps":args.steps,"learning_rate":optimizer.param_groups[0]["lr"],"gradient_clip_norm":gradient_clip_norm}),flush=True)
