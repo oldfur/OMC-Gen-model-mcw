@@ -176,12 +176,17 @@ def train(mode: str, s: dict, states: list[torch.Tensor], perms: list[list[int]]
         if any(parameter.grad is not None and not torch.isfinite(parameter.grad).all() for parameter in model.parameters()):
             raise FloatingPointError(f"non-finite gradient in {mode} at step {step}")
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
-        if step == 1 or step % 100 == 0 or step == STEPS:
+        if step % 100 == 0 or step == STEPS:
             model.eval(); metric = evaluate(model, s, states, perms); model.train()
             record = {"step": step, "loss": float(loss), "validation": metric}; curve.append(record)
             key = (metric["literal_accuracy"], metric["exact_R"])
             if key > best[:2]:
                 best = (*key, {name: value.detach().cpu().clone() for name, value in model.state_dict().items()})
+            print(
+                f"[role_oracle_partition_diagnostic] mode={mode} step={step}/{STEPS} loss={float(loss):.6f} "
+                f"literal_accuracy={metric['literal_accuracy']:.6f} exact_R={metric['exact_R']}/{len(states)}",
+                flush=True,
+            )
     final_state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
     torch.save({"state_dict": final_state, "step": STEPS, "mode": mode}, checkpoint_dir / "final.pt")
     model.load_state_dict(best[2]); torch.save({"state_dict": model.state_dict(), "step": "best_by_literal_accuracy_then_exact", "mode": mode}, checkpoint_dir / "best.pt")
