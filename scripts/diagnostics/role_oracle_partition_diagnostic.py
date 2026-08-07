@@ -207,8 +207,10 @@ def main() -> None:
     (OUT / "config_audit.json").write_text(json.dumps(audit, indent=2))
     trained, outputs = {}, {}
     for mode in MODES:
+        print(f"[role_oracle_partition_diagnostic] training mode={mode}", flush=True)
         model, training = train(mode, s, states, perms); trained[mode] = model; outputs[mode] = training
         (OUT / f"{mode}_metrics.json").write_text(json.dumps(training, indent=2))
+        print(f"[role_oracle_partition_diagnostic] completed mode={mode}", flush=True)
     # Required named metric files keep the mode names obvious to downstream readers.
     (OUT / "geometry_only_metrics.json").write_text(json.dumps(outputs["geometry_only"], indent=2))
     (OUT / "oracle_same_copy_metrics.json").write_text(json.dumps(outputs["oracle_same_copy"], indent=2))
