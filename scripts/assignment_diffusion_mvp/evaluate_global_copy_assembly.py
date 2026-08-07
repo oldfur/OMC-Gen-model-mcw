@@ -4,7 +4,13 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
+
 import torch
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from train_global_copy_assembly import load_setup
 from mattergen.assignment.global_copy_assembly.metrics import pair_partition_metrics, projected_molecular_bonds, projected_bond_metrics

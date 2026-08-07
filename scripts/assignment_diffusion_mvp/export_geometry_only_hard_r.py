@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 OUTPUT = Path("outputs/assignment_diffusion_mvp/global_copy_assembly_geometry_r")
 OUTPUT.mkdir(parents=True, exist_ok=True)
