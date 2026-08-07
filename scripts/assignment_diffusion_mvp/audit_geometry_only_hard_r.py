@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Audit a geometry-only hard-R artifact against structural and automorphism constraints."""
+"""Audit a geometry-only hard-R artifact against capacity and Aut(G_mol)^K gauge.
+
+Literal role metrics are DIAGNOSTIC_ONLY. Physical classification is:
+
+* GAUGE_EQUIVALENT_R — differences from R0 are explained by independent
+  per-copy molecular automorphisms;
+* STRUCTURALLY_INCORRECT_R — capacity/element violations, cross-copy
+  compensation (e.g. 1,1 vs 2,2), or any error outside Aut^K.
+
+Never canonicalizes predicted R toward oracle R0.
+"""
 from __future__ import annotations
 
 import json
@@ -12,7 +22,10 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from mattergen.assignment.global_copy_assembly.targets import build_assembly_target_from_predicted_roles
+from mattergen.assignment.global_copy_assembly.targets import (
+    build_assembly_target_from_predicted_roles,
+    permutations_to_group,
+)
 
 ROOT = Path("outputs/assignment_diffusion_mvp")
 ARTIFACT_PATH = Path("outputs/assignment_diffusion_mvp/global_copy_assembly_geometry_r/geometry_only_hard_r.jsonl")
@@ -54,6 +67,12 @@ def projected_bond(R: torch.Tensor, C: torch.Tensor, B: torch.Tensor) -> torch.T
 def main() -> None:
     sample = load_sample()
     artifact = load_artifact()
+    if artifact.get("role_source") != "geometry_only_hard_r":
+        raise ValueError(f"expected role_source=geometry_only_hard_r, got {artifact.get('role_source')!r}")
+    if "role_assignment" not in artifact:
+        raise ValueError("artifact missing role_assignment; refuse to invent or fall back to oracle R0")
+
+    # R_effective := R_artifact — no Aut alignment rewrite, no oracle repair.
     predicted_roles = torch.tensor(artifact["role_assignment"], dtype=torch.long)
     truth = sample["role"].long()
     m = int(sample["M"])
@@ -63,39 +82,14 @@ def main() -> None:
     if int(predicted_roles.min()) < 0 or int(predicted_roles.max()) >= m:
         raise ValueError("predicted roles contain out-of-range role labels")
 
-    role_sets = {role: (predicted_roles == role).nonzero().flatten().sort().values for role in range(m)}
-    role_capacity_valid = all(len(nodes) == k for nodes in role_sets.values())
-    element_compatible = bool(torch.equal(torch.sort(sample["role_z"][predicted_roles]).values, torch.sort(sample["z"]).values))
-    literal_accuracy = float((predicted_roles == truth).float().mean())
-
-    orbits = [value for _, value in sorted(json.loads(ORBIT_PATH.read_text())["role_orbits"].items(), key=lambda item: int(item[0]))]
-    orbit_ok = torch.tensor([int(int(predicted_roles[i])) in orbits[int(truth[i])] for i in range(len(truth))], dtype=torch.bool)
-    orbit_role_exact = bool(orbit_ok.all())
-
     perms = json.loads(AUT_PATH.read_text())["permutations"]
-    per_copy_automorphism_equivalent = True
-    copy = sample["copy"]
-    for c in range(int(copy.max()) + 1):
-        idx = (copy == c).nonzero().flatten()
-        if len(idx) == 0:
-            continue
-        truth_block = truth[idx]
-        block_ok = any(torch.equal(predicted_roles[idx], torch.tensor([perm[int(x)] for x in truth_block], dtype=torch.long)) for perm in perms)
-        per_copy_automorphism_equivalent &= block_ok
-
-    R_pred = r_onehot(predicted_roles, m)
-    R_truth = r_onehot(truth, m)
-    C0 = sample["copy"][:, None].eq(sample["copy"][None, :]).float()
-    B = molecular_bond_tensor(sample)
-    predicted_bonds = projected_bond(R_pred, C0, B)
-    true_bonds = projected_bond(R_truth, C0, B)
-    p, t = predicted_bonds.bool(), true_bonds.bool()
-    tp = int((p & t).sum())
-    fp = int((p & ~t).sum())
-    fn = int((~p & t).sum())
-    precision = tp / max(1, tp + fp)
-    recall = tp / max(1, tp + fn)
-    bond_f1 = 2 * precision * recall / max(1e-30, precision + recall)
+    orbits = [
+        value
+        for _, value in sorted(
+            json.loads(ORBIT_PATH.read_text())["role_orbits"].items(),
+            key=lambda item: int(item[0]),
+        )
+    ]
 
     target, audit = build_assembly_target_from_predicted_roles(
         predicted_roles,
@@ -106,27 +100,70 @@ def main() -> None:
         role_z=sample["role_z"],
         z=sample["z"],
         oracle_role=truth,
+        automorphism_permutations=perms,
+        role_orbits=orbits,
     )
-    classification = "GAUGE_EQUIVALENT_R" if audit.target_defined and not audit.structural_r_error else "STRUCTURALLY_INCORRECT_R"
+
+    # Prove no canonicalization leakage into target role sets.
+    if target is not None:
+        recovered = torch.empty(int(sample["N"]), dtype=torch.long)
+        for role, nodes in target.role_sets.items():
+            recovered[nodes] = int(role)
+        if not torch.equal(recovered, predicted_roles):
+            raise RuntimeError("audit target role sets diverged from R_artifact (canonicalization leak)")
+
+    C0 = sample["copy"][:, None].eq(sample["copy"][None, :]).float()
+    B = molecular_bond_tensor(sample)
+    R_pred = r_onehot(predicted_roles, m)
+    R_truth = r_onehot(truth, m)
+    predicted_bonds = projected_bond(R_pred, C0, B)
+    true_bonds = projected_bond(R_truth, C0, B)
+    p, t = predicted_bonds.bool(), true_bonds.bool()
+    tp = int((p & t).sum())
+    fp = int((p & ~t).sum())
+    fn = int((~p & t).sum())
+    precision = tp / max(1, tp + fp)
+    recall = tp / max(1, tp + fn)
+    bond_f1 = 2 * precision * recall / max(1e-30, precision + recall)
+
+    c_star_equals_c0 = None
+    if target is not None:
+        G_star = permutations_to_group(target)
+        c_star_equals_c0 = bool(torch.equal(G_star @ G_star.T, C0))
+
     payload = {
         "sample_id": sample["id"],
         "split": sample["split"],
         "source_artifact": str(ARTIFACT_PATH),
-        "classification": classification,
+        "classification": audit.status,
         "structural_r_error": bool(audit.structural_r_error),
-        "role_capacity_valid": role_capacity_valid,
-        "element_compatible": element_compatible,
-        "literal_role_accuracy": literal_accuracy,
-        "orbit_role_accuracy": float(orbit_ok.float().mean()),
-        "orbit_role_exact": orbit_role_exact,
-        "per_copy_automorphism_equivalent": per_copy_automorphism_equivalent,
+        "role_capacity_valid": bool(audit.role_capacity_valid),
+        "element_compatible": bool(audit.element_compatible),
+        # Literal metrics: diagnostic only (not a primary PASS gate).
+        "literal_metrics_scope": "DIAGNOSTIC_ONLY",
+        "literal_role_accuracy": float(audit.literal_accuracy),
+        "literal_exact_r": bool(audit.literal_exact),
+        # Physical / gauge metrics.
+        "orbit_role_accuracy": float(audit.orbit_role_accuracy),
+        "orbit_role_exact": bool(audit.orbit_role_exact),
+        "per_copy_automorphism_equivalent": bool(audit.per_copy_automorphism_equivalent),
+        "physical_role_assignment_exact": bool(audit.physical_role_assignment_exact),
         "target_defined": bool(audit.target_defined),
         "target_reason": audit.target_reason,
+        "c_star_equals_c0": c_star_equals_c0,
+        "r_effective_equals_artifact": True,
+        "canonicalization_applied": False,
         "projected_bond_precision": precision,
         "projected_bond_recall": recall,
         "projected_bond_f1": bond_f1,
         "projected_molecular_graph_exact": bool(torch.equal(p, t)),
-        "role_sizes": [int(nodes.numel()) for nodes in role_sets.values()],
+        "role_sizes": list(audit.role_sizes),
+        "representation": {
+            "R_shape_labels": [int(sample["N"])],
+            "R_onehot_shape": [int(sample["N"]), m],
+            "capacity_K": k,
+            "orbit_collapse": False,
+        },
     }
     OUTPUT.joinpath("geometry_only_r_audit.json").write_text(json.dumps(payload, indent=2))
     print(json.dumps(payload, sort_keys=True))

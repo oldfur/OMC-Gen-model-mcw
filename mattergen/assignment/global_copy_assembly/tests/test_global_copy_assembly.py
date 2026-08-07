@@ -10,7 +10,14 @@ from mattergen.assignment.global_copy_assembly.metrics import projected_molecula
 from mattergen.assignment.global_copy_assembly.module import GlobalCopyAssemblyConfig, GlobalStructuredCopyAssembly
 from mattergen.assignment.global_copy_assembly.pair_potential import BondPairPotential, permutation_factor
 from mattergen.assignment.global_copy_assembly.permutations import compose, enumerate_permutations, identity_index, inverse_permutations
-from mattergen.assignment.global_copy_assembly.targets import build_assembly_target, build_assembly_target_from_predicted_roles, permutations_to_group, target_state_indices, validate_uniform_batch_k
+from mattergen.assignment.global_copy_assembly.targets import (
+    build_assembly_target,
+    build_assembly_target_from_predicted_roles,
+    per_copy_automorphism_equivalent,
+    permutations_to_group,
+    target_state_indices,
+    validate_uniform_batch_k,
+)
 from mattergen.assignment.global_copy_assembly.tree_builder import build_bfs_tree, select_anchor_role
 from mattergen.assignment.global_copy_assembly.tree_crf import TreeCRF
 
@@ -19,6 +26,33 @@ def synthetic_target(M=3,K=2):
     # Stable atom indices are deliberately interleaved across roles/copies.
     role=torch.tensor([0,1,2,0,1,2]);copy=torch.tensor([0,1,0,1,0,1])
     return build_assembly_target(role,copy,M=M,K=K,anchor_role=0),role,copy
+
+
+def _rhodin_like_layout(*, M: int = 3, K: int = 4):
+    """Atoms grouped by copy then role: index = copy * M + role."""
+    roles = []
+    copies = []
+    for copy_id in range(K):
+        for role in range(M):
+            roles.append(role)
+            copies.append(copy_id)
+    oracle = torch.tensor(roles, dtype=torch.long)
+    copy = torch.tensor(copies, dtype=torch.long)
+    # Roles 1/2 share an element so Aut swap(1,2) preserves the element mask.
+    role_z = torch.tensor([1, 1, 1][:M], dtype=torch.long)
+    z = role_z[oracle]
+    # Aut(G_mol) = {id, swap(1,2)}; orbit partition [[0],[1,2]].
+    perms = [[0, 1, 2], [0, 2, 1]]
+    orbits = [[0], [1, 2], [1, 2]]
+    return oracle, copy, role_z, z, perms, orbits
+
+
+def _apply_per_copy_swaps(oracle: torch.Tensor, copy: torch.Tensor, swap_copies: set[int]) -> torch.Tensor:
+    pred = oracle.clone()
+    for i in range(int(oracle.numel())):
+        if int(copy[i]) in swap_copies and int(oracle[i]) in (1, 2):
+            pred[i] = 2 if int(oracle[i]) == 1 else 1
+    return pred
 
 
 def test_permutation_convention_round_trip_and_identity():
@@ -111,20 +145,27 @@ def test_failure_modes_fail_loudly():
 
 def test_predicted_role_audit_marks_gauge_equivalent_roles():
     target, _, copy = synthetic_target()
+    oracle = torch.tensor([0, 1, 2, 0, 1, 2])
+    perms = [[0, 1, 2], [0, 2, 1]]
+    orbits = [[0], [1, 2], [1, 2]]
     # role_z is the molecular table [M], never an atom-length vector.
     target2, audit = build_assembly_target_from_predicted_roles(
-        torch.tensor([0, 1, 2, 0, 1, 2]),
+        oracle,
         copy,
         M=3,
         K=2,
         anchor_role=0,
         role_z=torch.tensor([1, 1, 1]),
         z=torch.tensor([1, 1, 1, 1, 1, 1]),
-        oracle_role=torch.tensor([0, 1, 2, 0, 1, 2]),
+        oracle_role=oracle,
+        automorphism_permutations=perms,
+        role_orbits=orbits,
     )
     assert target2 is not None and audit.status == "GAUGE_EQUIVALENT_R"
     assert audit.element_compatible and audit.target_defined
+    assert audit.literal_metrics_scope == "DIAGNOSTIC_ONLY"
     assert audit.literal_accuracy == 1.0
+    assert audit.physical_role_assignment_exact and audit.per_copy_automorphism_equivalent
     G = permutations_to_group(target2)
     assert torch.equal(G @ G.T, copy[:, None].eq(copy[None, :]).float())
 
@@ -138,8 +179,19 @@ def test_predicted_role_element_check_indexes_role_z_by_role_labels_not_atom_ids
     z = role_z[role]
     # Atom index 11 appears in some role set; indexing role_z with atom ids would OOB.
     assert int((role == 1).nonzero().flatten().max()) >= 11 or N > M
+    identity = [list(range(M))]
+    orbits = [[r] for r in range(M)]
     target, audit = build_assembly_target_from_predicted_roles(
-        role, copy, M=M, K=K, anchor_role=0, role_z=role_z, z=z, oracle_role=role
+        role,
+        copy,
+        M=M,
+        K=K,
+        anchor_role=0,
+        role_z=role_z,
+        z=z,
+        oracle_role=role,
+        automorphism_permutations=identity,
+        role_orbits=orbits,
     )
     assert target is not None
     assert audit.element_compatible
@@ -147,11 +199,181 @@ def test_predicted_role_element_check_indexes_role_z_by_role_labels_not_atom_ids
     assert audit.status == "GAUGE_EQUIVALENT_R"
 
 
+def test_A_independent_per_copy_automorphism_gauge():
+    """Test A: independent per-copy 1↔2 swaps remain GAUGE_EQUIVALENT_R with C*=C0."""
+    M, K = 3, 4
+    oracle, copy, role_z, z, perms, orbits = _rhodin_like_layout(M=M, K=K)
+    # copy0 identity, copy1 swap, copy2 identity, copy3 swap
+    predicted = _apply_per_copy_swaps(oracle, copy, swap_copies={1, 3})
+    assert not torch.equal(predicted, oracle)
+    # Capacity preserved: each role still has exactly K instances.
+    for role in range(M):
+        assert int((predicted == role).sum()) == K
+    target, audit = build_assembly_target_from_predicted_roles(
+        predicted,
+        copy,
+        M=M,
+        K=K,
+        anchor_role=0,
+        role_z=role_z,
+        z=z,
+        oracle_role=oracle,
+        automorphism_permutations=perms,
+        role_orbits=orbits,
+    )
+    assert audit.status == "GAUGE_EQUIVALENT_R"
+    assert audit.per_copy_automorphism_equivalent
+    assert audit.physical_role_assignment_exact
+    assert audit.target_defined and target is not None
+    assert audit.literal_exact is False
+    assert audit.literal_metrics_scope == "DIAGNOSTIC_ONLY"
+    G = permutations_to_group(target)
+    C0 = copy[:, None].eq(copy[None, :]).float()
+    assert torch.equal(G @ G.T, C0)
+
+
+def test_B_capacity_violation_fails_structural():
+    """Test B: role1=K+1, role2=K-1 is illegal; Aut cannot legalize it."""
+    M, K = 3, 4
+    oracle, copy, role_z, z, perms, orbits = _rhodin_like_layout(M=M, K=K)
+    bad = oracle.clone()
+    # Move one role-2 atom onto role-1 → capacity (K+1, K-1).
+    idx_role2 = (bad == 2).nonzero(as_tuple=False).flatten()[0]
+    bad[idx_role2] = 1
+    assert int((bad == 1).sum()) == K + 1
+    assert int((bad == 2).sum()) == K - 1
+    target, audit = build_assembly_target_from_predicted_roles(
+        bad,
+        copy,
+        M=M,
+        K=K,
+        anchor_role=0,
+        role_z=role_z,
+        z=role_z[bad.clamp(0, M - 1)],
+        oracle_role=oracle,
+        automorphism_permutations=perms,
+        role_orbits=orbits,
+    )
+    assert target is None
+    assert audit.status == "STRUCTURALLY_INCORRECT_R"
+    assert not audit.role_capacity_valid
+    assert audit.structural_r_error
+    assert not audit.target_defined
+    assert audit.target_reason is not None
+    assert "TARGET_UNDEFINED_DUE_TO_STRUCTURAL_R_ERROR" in audit.target_reason
+
+
+def test_C_cross_copy_compensation_is_structurally_incorrect():
+    """Test C: global capacity OK but copy has 1,1 and another 2,2 → structural."""
+    M, K = 3, 4
+    oracle, copy, role_z, z, perms, orbits = _rhodin_like_layout(M=M, K=K)
+    bad = oracle.clone()
+    # Within copy 0: force both former roles 1 and 2 to role 1.
+    # Within copy 2: force both to role 2. Global |V_1|=|V_2|=K still holds.
+    for i in range(int(bad.numel())):
+        if int(copy[i]) == 0 and int(oracle[i]) in (1, 2):
+            bad[i] = 1
+        if int(copy[i]) == 2 and int(oracle[i]) in (1, 2):
+            bad[i] = 2
+    assert int((bad == 1).sum()) == K
+    assert int((bad == 2).sum()) == K
+    assert not per_copy_automorphism_equivalent(bad, oracle, copy, perms)
+    target, audit = build_assembly_target_from_predicted_roles(
+        bad,
+        copy,
+        M=M,
+        K=K,
+        anchor_role=0,
+        role_z=role_z,
+        z=role_z[bad],
+        oracle_role=oracle,
+        automorphism_permutations=perms,
+        role_orbits=orbits,
+    )
+    assert audit.status == "STRUCTURALLY_INCORRECT_R"
+    assert audit.structural_r_error
+    assert not audit.per_copy_automorphism_equivalent
+    assert not audit.physical_role_assignment_exact
+    assert target is None
+    assert not audit.target_defined
+    assert audit.target_reason is not None
+    assert "TARGET_UNDEFINED_DUE_TO_STRUCTURAL_R_ERROR" in audit.target_reason
+
+
+def test_D_no_canonicalization_leakage_r_effective_equals_artifact():
+    """Test D: R_effective from target.role_sets equals artifact and differs from R0."""
+    M, K = 3, 4
+    oracle, copy, role_z, z, perms, orbits = _rhodin_like_layout(M=M, K=K)
+    artifact = _apply_per_copy_swaps(oracle, copy, swap_copies={1})
+    assert not torch.equal(artifact, oracle)
+    target, audit = build_assembly_target_from_predicted_roles(
+        artifact,
+        copy,
+        M=M,
+        K=K,
+        anchor_role=0,
+        role_z=role_z,
+        z=z,
+        oracle_role=oracle,
+        automorphism_permutations=perms,
+        role_orbits=orbits,
+    )
+    assert target is not None
+    effective = torch.empty_like(artifact)
+    for role, nodes in target.role_sets.items():
+        effective[nodes] = int(role)
+    assert torch.equal(effective, artifact)
+    assert not torch.equal(effective, oracle)
+    assert audit.status == "GAUGE_EQUIVALENT_R"
+    assert audit.literal_exact is False
+
+
+def test_E_predicted_gauge_target_round_trip_to_C0():
+    """Test E: legal gauge-swapped R yields P*→G*→C*=C0 under predicted gauge."""
+    M, K = 3, 4
+    oracle, copy, role_z, z, perms, orbits = _rhodin_like_layout(M=M, K=K)
+    predicted = _apply_per_copy_swaps(oracle, copy, swap_copies={0, 2, 3})
+    target, audit = build_assembly_target_from_predicted_roles(
+        predicted,
+        copy,
+        M=M,
+        K=K,
+        anchor_role=0,
+        role_z=role_z,
+        z=z,
+        oracle_role=oracle,
+        automorphism_permutations=perms,
+        role_orbits=orbits,
+    )
+    assert audit.target_defined and target is not None
+    assert audit.status == "GAUGE_EQUIVALENT_R"
+    for role, state in target.permutations.items():
+        assert torch.equal(torch.sort(state).values, torch.arange(K))
+    G = permutations_to_group(target)
+    C0 = copy[:, None].eq(copy[None, :]).float()
+    assert torch.equal(G @ G.T, C0)
+    # Role sets remain predicted gauge (not oracle R0 sets).
+    for role in range(M):
+        assert torch.equal(
+            target.role_sets[role],
+            (predicted == role).nonzero(as_tuple=False).flatten().sort().values,
+        )
+
+
 def test_predicted_role_structural_capacity_error_is_audited_not_raised():
     copy = torch.tensor([0, 1, 0, 1, 0, 1])
     bad = torch.tensor([0, 0, 0, 0, 0, 0])
     target, audit = build_assembly_target_from_predicted_roles(
-        bad, copy, M=3, K=2, anchor_role=0, role_z=torch.tensor([1, 1, 1]), z=torch.tensor([1, 1, 1, 1, 1, 1])
+        bad,
+        copy,
+        M=3,
+        K=2,
+        anchor_role=0,
+        role_z=torch.tensor([1, 1, 1]),
+        z=torch.tensor([1, 1, 1, 1, 1, 1]),
+        oracle_role=torch.tensor([0, 1, 2, 0, 1, 2]),
+        automorphism_permutations=[[0, 1, 2], [0, 2, 1]],
+        role_orbits=[[0], [1, 2], [1, 2]],
     )
     assert target is None
     assert audit.structural_r_error
@@ -161,11 +383,24 @@ def test_predicted_role_structural_capacity_error_is_audited_not_raised():
 
 
 def test_predicted_role_audit_fails_loudly_when_target_cannot_be_constructed():
-    with pytest.raises(ValueError): build_assembly_target(torch.tensor([0,0,0,0,0,0]),torch.tensor([0,1,0,1,0,1]),M=3,K=2,anchor_role=0)
+    with pytest.raises(ValueError):
+        build_assembly_target(
+            torch.tensor([0, 0, 0, 0, 0, 0]),
+            torch.tensor([0, 1, 0, 1, 0, 1]),
+            M=3,
+            K=2,
+            anchor_role=0,
+        )
 
 
 def test_predicted_role_source_isolated_from_oracle_copy_supervision():
-    cfg=GlobalCopyAssemblyConfig(mode="clean_geometry_predicted_r", role_source="geometry_only_hard_r", use_oracle_role_assignment=False, use_oracle_copy_relation=False, use_copy_id_as_input=False)
+    cfg = GlobalCopyAssemblyConfig(
+        mode="clean_geometry_predicted_r",
+        role_source="geometry_only_hard_r",
+        use_oracle_role_assignment=False,
+        use_oracle_copy_relation=False,
+        use_copy_id_as_input=False,
+    )
     assert cfg.mode == "clean_geometry_predicted_r"
     assert cfg.role_source == "geometry_only_hard_r"
     assert not cfg.use_oracle_role_assignment

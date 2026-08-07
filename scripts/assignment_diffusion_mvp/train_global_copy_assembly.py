@@ -36,6 +36,14 @@ def load_setup(config_path: Path):
     if sample["id"]!=cfg["fixed_sample_id"] or sample["split"]!=cfg["split"]: raise ValueError("fixed sample identity/split mismatch")
     orbit_json=json.loads(automorphism_orbits_path.read_text())
     orbits=[value for _,value in sorted(orbit_json["role_orbits"].items(),key=lambda item:int(item[0]))]
+    automorphism_path = _resolve_path(
+        cfg,
+        "automorphism_permutations_path",
+        root / "outputs/assignment_diffusion_mvp/role_automorphism_audit/molecular_automorphisms.json",
+    )
+    automorphism_permutations = None
+    if automorphism_path.exists():
+        automorphism_permutations = json.loads(automorphism_path.read_text())["permutations"]
     allowed={field.name for field in fields(GlobalCopyAssemblyConfig)}; model_cfg=GlobalCopyAssemblyConfig(**{key:value for key,value in cfg.items() if key in allowed})
     model=GlobalStructuredCopyAssembly(model_cfg);tree=model.select_tree(orbits,sample["role_edge_index"],M=int(sample["M"]))
     if model_cfg.mode == "clean_geometry_predicted_r":
@@ -55,10 +63,12 @@ def load_setup(config_path: Path):
             raise ValueError(f"artifact role_source must be geometry_only_hard_r, got {artifact.get('role_source')!r}")
         if "role_assignment" not in artifact:
             raise ValueError(f"predicted-role artifact missing role_assignment (stub/incomplete?): {artifact_path}")
+        # R_effective := R_artifact. Forbidden: canonicalize toward sample["role"], Aut alignment rewrite, oracle repair.
         role_assignment = torch.tensor(artifact["role_assignment"], dtype=torch.long)
         if role_assignment.numel() != int(sample["N"]):
             raise ValueError("predicted-role artifact atom count mismatch")
-        # R_effective comes only from the geometry-only hard-R artifact; never sample["role"].
+        if int(role_assignment.min()) < 0 or int(role_assignment.max()) >= int(sample["M"]):
+            raise ValueError("predicted-role artifact has out-of-range role labels")
         target, audit = build_assembly_target_from_predicted_roles(
             role_assignment,
             sample["copy"],
@@ -68,16 +78,23 @@ def load_setup(config_path: Path):
             role_z=sample["role_z"],
             z=sample["z"],
             oracle_role=sample["role"],
+            automorphism_permutations=automorphism_permutations,
+            role_orbits=orbits,
         )
-        if target is None or audit.structural_r_error:
-            raise RuntimeError(f"predicted-role target construction failed: {audit}")
-        # Explicitly prove R_effective is the artifact, not oracle R0.
+        if target is None or not audit.target_defined:
+            raise RuntimeError(
+                "predicted-role target construction failed "
+                f"(no oracle-R fallback): {audit.target_reason or audit}"
+            )
+        # Prove R_effective is the artifact labels, not oracle R0 and not a rewritten gauge.
         predicted_labels = role_assignment.long()
         effective_labels = torch.empty(int(sample["N"]), dtype=torch.long)
         for role, nodes in target.role_sets.items():
             effective_labels[nodes] = int(role)
         if not torch.equal(effective_labels, predicted_labels):
             raise RuntimeError("R_effective from target.role_sets does not match geometry-only hard-R artifact")
+        if torch.equal(effective_labels, sample["role"].long()) and not audit.literal_exact:
+            raise RuntimeError("internal inconsistency: effective labels equal R0 but audit reports non-literal R")
         return cfg, sample, target, tree, model, audit
     target=build_assembly_target(sample["role"],sample["copy"],M=int(sample["M"]),K=int(sample["Z"]),anchor_role=tree.root)
     return cfg,sample,target,tree,model,None
@@ -128,7 +145,38 @@ def main():
     if gradient_clip_norm <= 0 or log_every_steps <= 0:
         raise ValueError("gradient_clip_norm and log_every_steps must be positive")
     output_dir=Path(cfg["output_dir"]);output_dir.mkdir(parents=True,exist_ok=True)
-    (output_dir/"config_audit.json").write_text(json.dumps({"status":"CLEAN_GEOMETRY_ORACLE_R_ONLY" if model.config.mode=="clean_geometry_oracle_r" else "CLEAN_GEOMETRY_PREDICTED_R","use_copy_id_as_input":False,"use_oracle_copy_relation":False,"sample":sample["id"],"device":str(device),"learning_rate":optimizer.param_groups[0]["lr"],"gradient_clip_norm":gradient_clip_norm,"pair_score_scale":model.config.pair_score_scale,"predicted_role_audit":None if role_audit is None else {"status": role_audit.status,"target_defined": role_audit.target_defined,"structural_r_error": role_audit.structural_r_error,"role_capacity_valid": role_audit.role_capacity_valid}},indent=2))
+    predicted_role_audit = None
+    if role_audit is not None:
+        predicted_role_audit = {
+            "status": role_audit.status,
+            "target_defined": role_audit.target_defined,
+            "structural_r_error": role_audit.structural_r_error,
+            "role_capacity_valid": role_audit.role_capacity_valid,
+            "element_compatible": role_audit.element_compatible,
+            "per_copy_automorphism_equivalent": role_audit.per_copy_automorphism_equivalent,
+            "physical_role_assignment_exact": role_audit.physical_role_assignment_exact,
+            "orbit_role_accuracy": role_audit.orbit_role_accuracy,
+            "orbit_role_exact": role_audit.orbit_role_exact,
+            "literal_accuracy": role_audit.literal_accuracy,
+            "literal_exact": role_audit.literal_exact,
+            "literal_metrics_scope": role_audit.literal_metrics_scope,
+            "target_reason": role_audit.target_reason,
+            "r_effective_equals_artifact": True,
+            "canonicalization_forbidden": True,
+        }
+    (output_dir/"config_audit.json").write_text(json.dumps({
+        "status": "CLEAN_GEOMETRY_ORACLE_R_ONLY" if model.config.mode == "clean_geometry_oracle_r" else "CLEAN_GEOMETRY_PREDICTED_R",
+        "use_copy_id_as_input": False,
+        "use_oracle_copy_relation": False,
+        "use_oracle_role_assignment": bool(model.config.use_oracle_role_assignment),
+        "role_source": model.config.role_source,
+        "sample": sample["id"],
+        "device": str(device),
+        "learning_rate": optimizer.param_groups[0]["lr"],
+        "gradient_clip_norm": gradient_clip_norm,
+        "pair_score_scale": model.config.pair_score_scale,
+        "predicted_role_audit": predicted_role_audit,
+    }, indent=2))
     (output_dir/"anchor_and_tree.json").write_text(json.dumps({"anchor":tree.root,"tree_edges":tree.tree_edges,"non_tree_edges":tree.non_tree_edges,"preorder":tree.preorder,"postorder":tree.postorder},indent=2))
     (output_dir/"permutation_convention.json").write_text(json.dumps({"convention":"P_r[q]=k: role-r instance q is assigned copy-gauge label k","anchor":"P_anchor[q]=q"},indent=2))
     print(json.dumps({"event":"training_start","device":str(device),"steps":args.steps,"learning_rate":optimizer.param_groups[0]["lr"],"gradient_clip_norm":gradient_clip_norm}),flush=True)

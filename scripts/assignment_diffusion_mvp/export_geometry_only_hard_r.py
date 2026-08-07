@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Export a real geometry-only hard-R artifact from the fixed RHODIN01 diagnostic checkpoint."""
+"""Export a real geometry-only hard-R artifact from the fixed RHODIN01 diagnostic checkpoint.
+
+Representation: full canonical hard labels of shape [N] (one-hot [N,M]) with
+capacity K per role. No orbit collapse.
+
+Forbidden in this exporter:
+* rewriting predicted R toward oracle R0;
+* best-automorphism canonicalization of the exported assignment;
+* silent fallback to sample[\"role\"].
+
+Literal accuracy is used only as a *selection diagnostic* among terminal MAP
+candidates; the exported role_assignment is always the raw Hungarian MAP.
+"""
 from __future__ import annotations
 
 import json
@@ -145,12 +157,17 @@ def main() -> None:
         "M": int(sample["M"]),
         "K": int(sample["Z"]),
         "role_source": "geometry_only_hard_r",
+        # Raw geometry-only MAP. R_effective for assembly must equal this list.
         "role_assignment": best_assignment,
         "model_context_mode": "geometry_only",
         "checkpoint": str(CHECKPOINT_PATH),
         "decoder": "independent element-block Hungarian MAP",
+        "canonicalization_applied": False,
+        "orbit_collapse": False,
         "terminal_state_index": int(best_metrics["terminal_state_index"]),
         "metrics": {
+            # Literal metrics are diagnostic only; not a primary PASS gate.
+            "literal_metrics_scope": "DIAGNOSTIC_ONLY",
             "literal_accuracy": float(best_metrics["literal_accuracy"]),
             "orbit_role_accuracy": float(best_metrics["orbit_role_accuracy"]),
             "literal_exact": bool(best_metrics["literal_exact"]),
