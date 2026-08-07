@@ -17,12 +17,24 @@ if str(ROOT_DIR) not in sys.path:
 from mattergen.assignment.global_copy_assembly import AssemblyTarget, GlobalCopyAssemblyConfig, GlobalStructuredCopyAssembly, build_assembly_target
 
 
+def _resolve_path(cfg: dict, key: str, fallback: Path | None = None) -> Path:
+    value = cfg.get(key)
+    if value:
+        return Path(value)
+    if fallback is not None:
+        return fallback
+    raise KeyError(f"missing required config entry: {key}")
+
+
 def load_setup(config_path: Path):
     cfg=yaml.safe_load(config_path.read_text())["global_copy_assembly"]
     if not cfg.get("enabled",False): raise ValueError("global_copy_assembly.enabled must be true for this standalone entry point")
-    sample=torch.load(cfg["fixed_sample_path"],map_location="cpu",weights_only=False)
+    root = Path(__file__).resolve().parents[2]
+    fixed_sample_path = _resolve_path(cfg, "fixed_sample_path", root / "outputs/assignment_diffusion_mvp/d1_fixed_clean_geometry/fixed_sample.pt")
+    automorphism_orbits_path = _resolve_path(cfg, "automorphism_orbits_path", root / "outputs/assignment_diffusion_mvp/role_automorphism_audit/role_orbits.json")
+    sample=torch.load(fixed_sample_path,map_location="cpu",weights_only=False)
     if sample["id"]!=cfg["fixed_sample_id"] or sample["split"]!=cfg["split"]: raise ValueError("fixed sample identity/split mismatch")
-    orbit_json=json.loads(Path(cfg["automorphism_orbits_path"]).read_text())
+    orbit_json=json.loads(automorphism_orbits_path.read_text())
     orbits=[value for _,value in sorted(orbit_json["role_orbits"].items(),key=lambda item:int(item[0]))]
     allowed={field.name for field in fields(GlobalCopyAssemblyConfig)}; model_cfg=GlobalCopyAssemblyConfig(**{key:value for key,value in cfg.items() if key in allowed})
     model=GlobalStructuredCopyAssembly(model_cfg);tree=model.select_tree(orbits,sample["role_edge_index"],M=int(sample["M"]))
