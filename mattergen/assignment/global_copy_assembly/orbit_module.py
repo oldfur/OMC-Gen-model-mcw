@@ -183,22 +183,24 @@ class OrbitAwareCopyAssembly(nn.Module):
         orbit_id: int,
         mode: str | None = None,
     ) -> torch.Tensor:
-        """F[k,i,j] for orbit local indices i,j and copy k."""
+        """F[k,i,j] for orbit local indices i,j and copy k (out-of-place; autograd-safe)."""
         n = int(orbit_atoms.numel())
         K = int(G_singleton.shape[1])
-        device = hx.device
-        F = torch.zeros(K, n, n, device=device, dtype=hx.dtype)
+        neg = hx.new_tensor(float("-inf"))
+        mats: list[torch.Tensor] = []
         for k in range(K):
             copy_atoms = ((G_singleton[:, k] > 0.5) & singleton_mask).nonzero(as_tuple=False).flatten()
             if copy_atoms.numel() == 0:
                 raise ValueError(f"singleton backbone copy {k} is empty")
             h_copy = hx[copy_atoms]
             frac_copy = frac[copy_atoms]
+            # Upper triangle scores first (unordered pairs).
+            upper: dict[tuple[int, int], torch.Tensor] = {}
             for i in range(n):
                 ai = int(orbit_atoms[i].item())
                 for j in range(i + 1, n):
                     aj = int(orbit_atoms[j].item())
-                    s = self.orbit_head.pair_score(
+                    upper[(i, j)] = self.orbit_head.pair_score(
                         h_i=hx[ai],
                         h_j=hx[aj],
                         frac_i=frac[ai],
@@ -209,11 +211,19 @@ class OrbitAwareCopyAssembly(nn.Module):
                         orbit_id=orbit_id,
                         mode=mode,
                     )
-                    F[k, i, j] = s
-                    F[k, j, i] = s
-        # diagonal stays 0 but DP never uses i==j
-        F = F + torch.diag_embed(torch.full((K, n), float("-inf"), device=device, dtype=hx.dtype))
-        return F
+            rows: list[torch.Tensor] = []
+            for i in range(n):
+                cols: list[torch.Tensor] = []
+                for j in range(n):
+                    if i == j:
+                        cols.append(neg)
+                    elif i < j:
+                        cols.append(upper[(i, j)])
+                    else:
+                        cols.append(upper[(j, i)])
+                rows.append(torch.stack(cols, dim=0))
+            mats.append(torch.stack(rows, dim=0))
+        return torch.stack(mats, dim=0)
 
     def loss(
         self,

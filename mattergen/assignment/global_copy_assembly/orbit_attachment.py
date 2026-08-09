@@ -154,6 +154,97 @@ def _pair_list(n: int) -> list[tuple[int, int]]:
     return [(i, j) for i in range(n) for j in range(i + 1, n)]
 
 
+def _neg_inf_scalar(like: torch.Tensor) -> torch.Tensor:
+    return like.new_tensor(float("-inf"))
+
+
+def _balanced_attachment_log_partition(F: torch.Tensor, *, atoms_per_copy: int = 2) -> torch.Tensor:
+    """Autograd-safe exact logZ via layer-wise list DP (no tensor inplace writes)."""
+    if F.ndim != 3 or F.shape[1] != F.shape[2]:
+        raise ValueError("F must have shape [K,n,n]")
+    K, n, _ = F.shape
+    if n != atoms_per_copy * K:
+        raise ValueError(f"n={n} must equal atoms_per_copy*K={atoms_per_copy * K}")
+    if atoms_per_copy != 2:
+        raise NotImplementedError("MVP bitmask DP implements atoms_per_copy=2 only")
+    n_masks = 1 << n
+    pairs = _pair_list(n)
+    # Python list of scalar tensors: rebinding entries is not an inplace Tensor op.
+    log_dp: list[torch.Tensor] = [_neg_inf_scalar(F) for _ in range(n_masks)]
+    log_dp[0] = F.new_zeros(())
+    for k in range(K):
+        new_dp: list[torch.Tensor] = [_neg_inf_scalar(F) for _ in range(n_masks)]
+        for mask in range(n_masks):
+            base = log_dp[mask]
+            # Skip unreachable masks (hard -inf). Use detach so the check is not graph-facing.
+            if float(base.detach()) == float("-inf"):
+                continue
+            for i, j in pairs:
+                bit = (1 << i) | (1 << j)
+                if mask & bit:
+                    continue
+                new_mask = mask | bit
+                cand = base + F[k, i, j]
+                # List rebinding (not Tensor.__setitem__) keeps autograd version counters clean.
+                new_dp[new_mask] = torch.logaddexp(new_dp[new_mask], cand)
+        log_dp = new_dp
+    log_z = log_dp[(1 << n) - 1]
+    if not torch.isfinite(log_z.detach()):
+        raise FloatingPointError("balanced attachment DP produced non-finite logZ")
+    return log_z
+
+
+@torch.no_grad()
+def _balanced_attachment_map(F: torch.Tensor, *, atoms_per_copy: int = 2) -> tuple[torch.Tensor, tuple[tuple[int, int], ...]]:
+    """Exact MAP under no_grad (backpointers; not needed for structured NLL grads)."""
+    if F.ndim != 3 or F.shape[1] != F.shape[2]:
+        raise ValueError("F must have shape [K,n,n]")
+    K, n, _ = F.shape
+    if n != atoms_per_copy * K:
+        raise ValueError(f"n={n} must equal atoms_per_copy*K={atoms_per_copy * K}")
+    if atoms_per_copy != 2:
+        raise NotImplementedError("MVP bitmask DP implements atoms_per_copy=2 only")
+    device = F.device
+    dtype = F.dtype
+    n_masks = 1 << n
+    max_dp = torch.full((K + 1, n_masks), float("-inf"), device=device, dtype=dtype)
+    back_i = torch.full((K + 1, n_masks), -1, device=device, dtype=torch.long)
+    back_j = torch.full((K + 1, n_masks), -1, device=device, dtype=torch.long)
+    max_dp[0, 0] = 0.0
+    pairs = _pair_list(n)
+    for k in range(K):
+        for mask in range(n_masks):
+            base = max_dp[k, mask]
+            if not torch.isfinite(base):
+                continue
+            for i, j in pairs:
+                bit = (1 << i) | (1 << j)
+                if mask & bit:
+                    continue
+                new_mask = mask | bit
+                cand = base + F[k, i, j]
+                if cand > max_dp[k + 1, new_mask]:
+                    max_dp[k + 1, new_mask] = cand
+                    back_i[k + 1, new_mask] = i
+                    back_j[k + 1, new_mask] = j
+    full = (1 << n) - 1
+    map_score = max_dp[K, full]
+    if not torch.isfinite(map_score):
+        raise FloatingPointError("balanced attachment MAP produced non-finite score")
+    pairs_rev: list[tuple[int, int]] = []
+    mask = full
+    for k in range(K, 0, -1):
+        i = int(back_i[k, mask].item())
+        j = int(back_j[k, mask].item())
+        if i < 0 or j < 0:
+            raise RuntimeError(f"missing backpointer at copy stage {k}")
+        pairs_rev.append((i, j) if i < j else (j, i))
+        mask ^= (1 << i) | (1 << j)
+    if mask != 0:
+        raise RuntimeError("MAP reconstruction did not consume full mask")
+    return map_score, tuple(reversed(pairs_rev))
+
+
 def balanced_attachment_dp(
     F: torch.Tensor,
     *,
@@ -169,6 +260,11 @@ def balanced_attachment_dp(
         diagonal unused.  ``n`` must equal ``atoms_per_copy * K``.
     target_pairs:
         Optional list of length K of local index pairs for structured NLL.
+
+    Notes
+    -----
+    ``log_partition`` / ``target_score`` are autograd-safe (no inplace Tensor
+    writes on the forward graph).  MAP uses a separate no_grad max-DP.
     """
     if F.ndim != 3 or F.shape[1] != F.shape[2]:
         raise ValueError("F must have shape [K,n,n]")
@@ -177,77 +273,27 @@ def balanced_attachment_dp(
         raise ValueError(f"n={n} must equal atoms_per_copy*K={atoms_per_copy * K}")
     if atoms_per_copy != 2:
         raise NotImplementedError("MVP bitmask DP implements atoms_per_copy=2 only")
-    device = F.device
-    dtype = F.dtype
-    n_masks = 1 << n
-    neg = torch.tensor(float("-inf"), device=device, dtype=dtype)
-    # log-sum DP and max DP
-    log_dp = torch.full((K + 1, n_masks), float("-inf"), device=device, dtype=dtype)
-    max_dp = torch.full((K + 1, n_masks), float("-inf"), device=device, dtype=dtype)
-    back_i = torch.full((K + 1, n_masks), -1, device=device, dtype=torch.long)
-    back_j = torch.full((K + 1, n_masks), -1, device=device, dtype=torch.long)
-    log_dp[0, 0] = torch.zeros((), device=device, dtype=dtype)
-    max_dp[0, 0] = torch.zeros((), device=device, dtype=dtype)
 
-    pairs = _pair_list(n)
-    for k in range(K):
-        for mask in range(n_masks):
-            if not torch.isfinite(log_dp[k, mask]):
-                continue
-            base_log = log_dp[k, mask]
-            base_max = max_dp[k, mask]
-            for i, j in pairs:
-                bit = (1 << i) | (1 << j)
-                if mask & bit:
-                    continue
-                new_mask = mask | bit
-                score = F[k, i, j]
-                # logsumexp transition
-                cand_log = base_log + score
-                log_dp[k + 1, new_mask] = torch.logaddexp(log_dp[k + 1, new_mask], cand_log)
-                # max transition
-                cand_max = base_max + score
-                if cand_max > max_dp[k + 1, new_mask]:
-                    max_dp[k + 1, new_mask] = cand_max
-                    back_i[k + 1, new_mask] = i
-                    back_j[k + 1, new_mask] = j
-
-    full = (1 << n) - 1
-    log_z = log_dp[K, full]
-    map_score = max_dp[K, full]
-    if not torch.isfinite(log_z) or not torch.isfinite(map_score):
-        raise FloatingPointError("balanced attachment DP produced non-finite logZ/MAP")
-
-    # reconstruct MAP pairs (from last copy backward)
-    pairs_rev: list[tuple[int, int]] = []
-    mask = full
-    for k in range(K, 0, -1):
-        i = int(back_i[k, mask].item())
-        j = int(back_j[k, mask].item())
-        if i < 0 or j < 0:
-            raise RuntimeError(f"missing backpointer at copy stage {k}")
-        pairs_rev.append((i, j) if i < j else (j, i))
-        mask ^= (1 << i) | (1 << j)
-    map_pairs = tuple(reversed(pairs_rev))
-    if mask != 0:
-        raise RuntimeError("MAP reconstruction did not consume full mask")
+    log_z = _balanced_attachment_log_partition(F, atoms_per_copy=atoms_per_copy)
+    map_score, map_pairs = _balanced_attachment_map(F, atoms_per_copy=atoms_per_copy)
 
     target_score = None
     if target_pairs is not None:
         if len(target_pairs) != K:
             raise ValueError("target_pairs must have length K")
         used = 0
-        acc = torch.zeros((), device=device, dtype=dtype)
+        full = (1 << n) - 1
+        terms: list[torch.Tensor] = []
         for k, (i, j) in enumerate(target_pairs):
             a, b = (i, j) if i < j else (j, i)
             bit = (1 << a) | (1 << b)
             if used & bit:
                 raise ValueError("target_pairs are not disjoint")
             used |= bit
-            acc = acc + F[k, a, b]
+            terms.append(F[k, a, b])
         if used != full:
             raise ValueError("target_pairs must cover all orbit atoms")
-        target_score = acc
+        target_score = torch.stack(terms).sum()
 
     return AttachmentResult(
         log_partition=log_z,
