@@ -1,0 +1,47 @@
+orbit_copy_assembly:
+  enabled: true
+  mode: clean_geometry_orbit_aware
+  role_source: geometry_only_hard_r
+  non_singleton_strategy: exact_capacity_attachment
+  parameterization: singleton_tree_crf_plus_orbit_bitmask
+
+  use_oracle_role_assignment: false
+  use_oracle_copy_relation: false
+  use_copy_id_as_input: false
+
+  singleton_tree_weight: 1.0
+  orbit_attachment_weight: 1.0
+  pair_aux_weight: 0.1
+
+  gauge_marginalization: logsumexp
+  exact_attachment_solver: bitmask_dp
+
+  crystal_hidden_dim: 256
+  crystal_num_layers: 4
+  molecular_hidden_dim: 256
+  pair_hidden_dim: 256
+  distance_rbf_dim: 32
+  pair_score_scale: 20.0
+
+  fixed_sample_id: RHODIN01|4|gener|9b810e76ec9d286
+  split: val
+  seed: 17
+  steps: 5000
+  learning_rate: 5.0e-5
+  weight_decay: 1.0e-4
+  gradient_clip_norm: 1.0
+  log_every_steps: 10
+  device: auto
+
+  # Paths (repo-root relative; overridden by train/eval defaults if missing)
+  fixed_sample_path: outputs/assignment_diffusion_mvp/d1_fixed_clean_geometry/fixed_sample.pt
+  automorphism_orbits_path: outputs/assignment_diffusion_mvp/role_automorphism_audit/role_orbits.json
+  predicted_role_artifact_path: outputs/assignment_diffusion_mvp/global_copy_assembly_geometry_r/geometry_only_hard_r.jsonl
+  output_dir: outputs/assignment_diffusion_mvp/global_copy_assembly_orbit_aware_o2
+
+  # Ablation hooks (implemented as config flags; not run in this commit)
+  ablation:
+    A_canonical_r_old_assembly: false
+    B_orbit_aware_o2: true
+    C_oracle_orbit_membership: false
+    D_geometry_modes: [correct_geometry, zero_geometry]

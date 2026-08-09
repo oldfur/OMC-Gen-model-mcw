@@ -178,14 +178,75 @@ geometry-only checkpoint
   → G → C
 ```
 
-### Current experimental hypothesis
+### Current experimental hypothesis (canonical predicted-R path)
 
-Remote runs should check whether a geometry hard assignment that is
+Remote runs may check whether a geometry hard assignment that is
 **not** literally \(R_0\) but is equivalent modulo
 \(\operatorname{Aut}(G_{\rm mol})^K\) still yields \(\widehat C=C_0\).
 
-If \(\widehat R\) is structurally incorrect (outside that gauge class), target
-construction fails explicitly; there is no oracle-R fallback.
+If \(\widehat R\) is structurally incorrect (outside that gauge class), the
+**canonical-role** target construction fails explicitly; there is no oracle-R
+fallback.
+
+## Experiment O2 — orbit-aware full copy assembly
+
+Geometry-only hard \(R\) can be orbit-role exact and bond-correct under oracle
+\(C_0\) while still failing per-copy Aut equivalence (cross-copy compensation
+on roles 1/2). O2 therefore does **not** require
+
+\[
+P_r\in S_K \quad\text{for non-singleton roles.}
+\]
+
+### Orbit membership (deterministic collapse)
+
+Decoder still emits canonical \(\widehat R\in\{0,1\}^{N\times M}\). Before
+assembly:
+
+\[
+\bar R_{io}=\sum_{r\in o}\widehat R_{ir},
+\qquad
+\bar R\in\{0,1\}^{N\times J}.
+\]
+
+RHODIN01: \(J=9\), orbits `[[0],[1,2],[3],…,[9]]`, so \(|V_{12}|=2K=8\).
+
+### Stage A — singleton backbone
+
+Singleton orbits keep \(|V_r|=K\) and reuse tree-CRF permutations \(P_r\in S_K\).
+The singleton molecular graph may be disconnected after removing non-singleton
+roles; `singleton_backbone` adds virtual edges from full-graph shortest paths
+(path length + bond-type sequence) and builds a deterministic BFS tree.
+
+### Stage B — exact orbit attachment
+
+For orbit \(\{1,2\}\), attach 8 atoms to 4 copies with 2 atoms/copy using
+bitmask DP:
+
+\[
+DP(k,S)=\max_{|U|=2,\,U\cap S=\emptyset}\big[DP(k-1,S\setminus U)+F_{12}(U,k)\big].
+\]
+
+Pair scores \(F_{12}\) are gauge-marginalized:
+
+\[
+F_{12}(\{i,j\},k)=\operatorname{logsumexp}(S_{12},S_{21})-\log 2,
+\]
+
+invariant to swapping \((i,j)\). Structured NLL uses the same DP with
+`logsumexp` transitions for \(\log Z\).
+
+### Final \(G,C\)
+
+Merge singleton rows and orbit rows into \(G\in\{0,1\}^{N\times K}\), enforce
+\(\bar R^\top G = m\mathbf{1}_K^\top\), then \(C=GG^\top\).
+
+### Entrypoints
+
+* config: `configs/assignment_diffusion_mvp/global_copy_assembly_orbit_aware_o2.yaml`
+* train: `scripts/assignment_diffusion_mvp/train_global_copy_assembly_orbit_o2.py`
+* eval: `scripts/assignment_diffusion_mvp/evaluate_global_copy_assembly_orbit_o2.py`
+* remote: `scripts/assignment_diffusion_mvp/run_global_copy_assembly_orbit_o2_remote.sh`
 
 ## Future-only output contract
 

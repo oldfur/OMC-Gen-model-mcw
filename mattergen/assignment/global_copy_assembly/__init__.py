@@ -7,6 +7,8 @@ Does not implement assignment diffusion or the pos/cell denoiser.
 """
 
 from .module import GlobalCopyAssemblyConfig, GlobalStructuredCopyAssembly
+from .orbit_module import OrbitAwareAssemblyConfig, OrbitAwareCopyAssembly
+from .orbit_membership import build_orbit_partition, collapse_roles_to_orbit_membership
 from .targets import (
     AssemblyTarget,
     PredictedRoleAudit,
@@ -23,10 +25,14 @@ __all__ = [
     "AssemblyTarget",
     "GlobalCopyAssemblyConfig",
     "GlobalStructuredCopyAssembly",
+    "OrbitAwareAssemblyConfig",
+    "OrbitAwareCopyAssembly",
     "PredictedRoleAudit",
     "TreeCRF",
     "build_assembly_target",
     "build_assembly_target_from_predicted_roles",
+    "build_orbit_partition",
+    "collapse_roles_to_orbit_membership",
     "orbit_role_metrics",
     "per_copy_automorphism_equivalent",
     "permutations_to_group",
