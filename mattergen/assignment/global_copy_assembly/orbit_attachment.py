@@ -42,8 +42,10 @@ class OrbitAttachmentHead(nn.Module):
         self.gauge_marginalization = gauge_marginalization
         self.cutoff = cutoff
         self.register_buffer("centres", torch.linspace(0.0, cutoff, rbf_dim))
-        # Features: h_i, h_j, h_copy, |hi-hj|, hi*hj, rbf_ij, rbf_i_copy, rbf_j_copy, orbit_emb, gauge_token
-        in_dim = 5 * hidden + 3 * rbf_dim + hidden + hidden
+        # Ordered features: (h_i, h_j, ...) define local Aut gauge 1/2 by argument order.
+        # Unordered F({i,j}) marginalizes both orders — exact swap invariance.
+        # Features: h_i, h_j, h_copy, |hi-hj|, hi*hj, rbf_ij, rbf_i_copy, rbf_j_copy, orbit_emb
+        in_dim = 5 * hidden + 3 * rbf_dim + hidden
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.SiLU(),
@@ -52,7 +54,6 @@ class OrbitAttachmentHead(nn.Module):
             nn.Linear(hidden, 1),
         )
         self.orbit_embedding = nn.Embedding(16, hidden)
-        self.gauge_embedding = nn.Embedding(2, hidden)  # 0: 12, 1: 21 — marginalized out
         self.copy_pool = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
 
     def _rbf(self, distance: torch.Tensor) -> torch.Tensor:
@@ -74,9 +75,8 @@ class OrbitAttachmentHead(nn.Module):
         frac_copy: torch.Tensor,
         cell: torch.Tensor,
         orbit_id: int,
-        gauge_id: int,
     ) -> torch.Tensor:
-        """Scalar score S for ordered local gauge (gauge_id 0=12, 1=21)."""
+        """Scalar score S for one ordered local Aut gauge (argument order = 1/2 gauge)."""
         if h_copy.ndim != 2:
             raise ValueError("h_copy must be [M_sing,H]")
         h_pool = self.copy_pool(h_copy.mean(0, keepdim=False))
@@ -86,13 +86,12 @@ class OrbitAttachmentHead(nn.Module):
         d_j = self._pbc_distance(frac_j.unsqueeze(0).expand(len(frac_copy), -1), frac_copy, cell).mean()
         rbf = torch.cat([self._rbf(d_ij), self._rbf(d_i), self._rbf(d_j)], dim=-1)
         orbit = self.orbit_embedding(
-            torch.as_tensor(orbit_id, device=h_i.device, dtype=torch.long).clamp(0, self.orbit_embedding.num_embeddings - 1)
-        )
-        gauge = self.gauge_embedding(
-            torch.as_tensor(gauge_id, device=h_i.device, dtype=torch.long).clamp(0, 1)
+            torch.as_tensor(orbit_id, device=h_i.device, dtype=torch.long).clamp(
+                0, self.orbit_embedding.num_embeddings - 1
+            )
         )
         feat = torch.cat(
-            [h_i, h_j, h_pool, (h_i - h_j).abs(), h_i * h_j, rbf, orbit, gauge],
+            [h_i, h_j, h_pool, (h_i - h_j).abs(), h_i * h_j, rbf, orbit],
             dim=-1,
         )
         raw = self.net(feat).squeeze(-1)
@@ -111,19 +110,35 @@ class OrbitAttachmentHead(nn.Module):
         orbit_id: int = 0,
         mode: str | None = None,
     ) -> torch.Tensor:
-        """Gauge-marginalized unordered pair score F({i,j}, k)."""
+        """Gauge-marginalized unordered pair score F({i,j}, k).
+
+        S_12 = S(i→j), S_21 = S(j→i).  Then
+        F = logsumexp(S_12, S_21) - log(2)  (or max),
+        which is *exactly* invariant to swapping the call arguments (i,j)↔(j,i).
+        """
         mode = self.gauge_marginalization if mode is None else mode
         s12 = self.score_ordered_pair(
-            h_i=h_i, h_j=h_j, frac_i=frac_i, frac_j=frac_j,
-            h_copy=h_copy, frac_copy=frac_copy, cell=cell, orbit_id=orbit_id, gauge_id=0,
+            h_i=h_i,
+            h_j=h_j,
+            frac_i=frac_i,
+            frac_j=frac_j,
+            h_copy=h_copy,
+            frac_copy=frac_copy,
+            cell=cell,
+            orbit_id=orbit_id,
         )
         s21 = self.score_ordered_pair(
-            h_i=h_j, h_j=h_i, frac_i=frac_j, frac_j=frac_i,
-            h_copy=h_copy, frac_copy=frac_copy, cell=cell, orbit_id=orbit_id, gauge_id=1,
+            h_i=h_j,
+            h_j=h_i,
+            frac_i=frac_j,
+            frac_j=frac_i,
+            h_copy=h_copy,
+            frac_copy=frac_copy,
+            cell=cell,
+            orbit_id=orbit_id,
         )
         if mode == "max":
             return torch.maximum(s12, s21)
-        # logsumexp marginalization, normalized by log(2)
         return torch.logsumexp(torch.stack([s12, s21], dim=0), dim=0) - math.log(2.0)
 
 
