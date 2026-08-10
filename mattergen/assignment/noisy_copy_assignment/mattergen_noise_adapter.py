@@ -93,13 +93,26 @@ class MatterGenNoisyGeometry:
 
 
 class _BatchView:
-    """Minimal BatchedData-like object for MultiCorruption.sample_marginal."""
+    """Minimal BatchedData-like object for MultiCorruption.sample_marginal.
+
+    Must implement ``__contains__``: MultiCorruption.apply does
+    ``field_name in batch`` (see multi_corruption.apply).  Objects that only
+    define ``__getitem__`` fall back to the old sequence protocol and probe
+    ``batch[0], batch[1], ...``, which raises ``KeyError: 0`` for a mapping.
+    ``SimpleBatchedData`` implements the same ``__contains__`` contract.
+    """
 
     def __init__(self, store: dict):
         self._store = store
 
     def __getitem__(self, key: str):
         return self._store[key]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._store
+
+    def __iter__(self):
+        return iter(self._store)
 
     def keys(self):
         return self._store.keys()
@@ -109,11 +122,14 @@ class _BatchView:
 
     def get_batch_idx(self, field_name: str) -> torch.Tensor | None:
         if field_name == "pos":
-            # single crystal: all atoms belong to batch 0
+            # single crystal: all atoms belong to batch 0 (sparse / per-node field)
             n = int(self._store["pos"].shape[0])
             return torch.zeros(n, dtype=torch.long, device=self._store["pos"].device)
         if field_name == "cell":
-            return torch.zeros(1, dtype=torch.long, device=self._store["cell"].device)
+            # dense graph-level field (matches ChemGraphBatch / LatticeVPSDE)
+            return None
+        if field_name == "num_atoms":
+            return None
         return None
 
     def replace(self, **kwargs):

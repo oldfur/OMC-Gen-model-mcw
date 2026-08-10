@@ -51,6 +51,27 @@ def test_1_mattergen_noise_reuses_native_classes():
     assert "randn_like" not in src or "corruption" in src
 
 
+def test_batch_view_supports_membership_like_simple_batched_data():
+    """MultiCorruption.apply uses ``field in batch``; must not probe batch[0]."""
+    from mattergen.assignment.noisy_copy_assignment.mattergen_noise_adapter import _BatchView
+
+    batch = _BatchView(
+        {
+            "pos": torch.rand(4, 3),
+            "cell": torch.eye(3).unsqueeze(0),
+            "num_atoms": torch.tensor([4]),
+        }
+    )
+    assert "pos" in batch
+    assert "cell" in batch
+    assert "num_atoms" in batch
+    assert 0 not in batch
+    # membership must not raise KeyError: 0
+    assert "missing" not in batch
+    assert batch.get_batch_idx("cell") is None
+    assert batch.get_batch_idx("pos").tolist() == [0, 0, 0, 0]
+
+
 def test_2_clean_limit_t_near_zero_close_to_input():
     adapter = MatterGenNativeNoiseAdapter()
     n, pos0 = 8, torch.rand(8, 3)
