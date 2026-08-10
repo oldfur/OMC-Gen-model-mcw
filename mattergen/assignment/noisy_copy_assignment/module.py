@@ -378,6 +378,12 @@ class NoisyCopyAssignmentN1(nn.Module):
             )
             margins = attachment_map_margins(F, atoms_per_copy=ot.atoms_per_copy, target_pairs=list(ot.pairs_local))
             soft_diag["orbit_attachment_margins"] = margins
+            soft_diag["soft_C_kind"] = SOFT_C_KIND
+            soft_diag["soft_C_note"] = (
+                "c_soft is conditional-on-singleton-MAP structured soft C: "
+                "singleton groups fixed at MAP; orbit attachments Boltzmann-averaged "
+                "under that backbone. Not full joint structured P(g_i=g_j)."
+            )
         diag = {
             "status": "NOISY_COPY_ASSIGNMENT_N1",
             "orbit_mode": mode,
