@@ -494,6 +494,38 @@ def test_extractor_mirrors_denoiser_forward_signature():
     assert "torch.no_grad" in src
 
 
+def test_build_chemgraph_is_pyg_batch_for_get_batch_idx():
+    """GemNetTDenoiser requires ChemGraphBatch; bare ChemGraph asserts in get_batch_idx."""
+    from torch_geometric.data import Batch
+
+    from mattergen.assignment.noisy_copy_assignment.gemnet_loader import GemNetHiddenExtractor
+
+    # Minimal stand-in only to call build_chemgraph_from_sample
+    class _D(nn.Module):
+        hidden_dim = 8
+
+        def __init__(self):
+            super().__init__()
+            self.p = nn.Parameter(torch.zeros(1))
+
+    # bypass freeze on real denoiser interface
+    ext = GemNetHiddenExtractor.__new__(GemNetHiddenExtractor)
+    nn.Module.__init__(ext)
+    ext.denoiser = _D()
+    n = 5
+    g = ext.build_chemgraph_from_sample(
+        frac=torch.rand(n, 3),
+        cell=torch.eye(3),
+        atomic_numbers=torch.ones(n, dtype=torch.long),
+        extra=None,
+    )
+    assert isinstance(g, Batch)
+    batch_idx = g.get_batch_idx("pos")
+    assert batch_idx is not None
+    assert batch_idx.tolist() == [0] * n
+    assert int(g["num_atoms"].reshape(-1)[0]) == n
+
+
 def test_no_oracle_c_in_extractor_kwargs():
     src = inspect.getsource(GemNetHiddenExtractor.build_chemgraph_from_sample)
     assert "ORACLE_ASSIGNMENT_DENYLIST" in src or "mol_copy_id" in src

@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch_geometric.data import Batch
 
 from mattergen.common.data.chemgraph import ChemGraph
 from mattergen.common.utils.data_classes import MatterGenCheckpointInfo
