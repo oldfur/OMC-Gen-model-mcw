@@ -329,13 +329,23 @@ class GemNetHiddenExtractor(nn.Module):
         atomic_numbers: torch.Tensor,
         extra: dict | None = None,
     ) -> ChemGraph:
+        """Build a **batched** ChemGraph (batch size 1).
+
+        ``GemNetTDenoiser.forward`` calls ``x.get_batch_idx("pos")``, which
+        asserts ``isinstance(x, pyg Batch)``.  A bare single-structure ChemGraph
+        therefore raises AssertionError; wrap with ``Batch.from_data_list``.
+        """
         n = int(atomic_numbers.numel())
         lat = cell if cell.ndim == 3 else cell.unsqueeze(0)
+        if lat.shape[0] != 1:
+            raise ValueError(f"N1 extractor expects a single lattice, got cell shape {tuple(lat.shape)}")
         kwargs: dict[str, Any] = dict(
             atomic_numbers=atomic_numbers.long(),
             pos=frac,
             cell=lat,
+            # graph-level: shape [1] so PyG batch keeps [B] after collate
             num_atoms=torch.tensor([n], dtype=torch.long, device=frac.device),
+            num_nodes=n,
         )
         if extra:
             for key, val in extra.items():
@@ -348,7 +358,10 @@ class GemNetHiddenExtractor(nn.Module):
                         kwargs[key] = val.to(device=frac.device)
                     else:
                         kwargs[key] = val
-        return ChemGraph(**kwargs)
+        single = ChemGraph(**kwargs)
+        # ChemGraphBatch via PyG DynamicInheritance (same as training collate path)
+        batched = Batch.from_data_list([single])
+        return batched  # type: ignore[return-value]
 
     def extract(
         self,
@@ -370,6 +383,7 @@ class GemNetHiddenExtractor(nn.Module):
             raise ValueError("N1 fixed-sample extractor expects scalar t per crystal")
 
         # Mirror GemNetTDenoiser.forward (mattergen/denoiser.py) up to node_embeddings.
+        # x is a ChemGraphBatch (batch size 1); get_batch_idx is valid.
         frac_coords, lattice, atom_types, num_atoms, batch = (
             x["pos"],
             x["cell"],
@@ -377,6 +391,11 @@ class GemNetHiddenExtractor(nn.Module):
             x["num_atoms"],
             x.get_batch_idx("pos"),
         )
+        if batch is None:
+            # dense fallback should not happen for per-atom pos; keep N1 robust
+            batch = torch.zeros(
+                int(frac_coords.shape[0]), dtype=torch.long, device=frac_coords.device
+            )
         t_enc = self.denoiser.noise_level_encoding(t).to(lattice.device)
         z_per_crystal = t_enc
         property_embedding_values = get_property_embeddings(
