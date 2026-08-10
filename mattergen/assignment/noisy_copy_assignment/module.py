@@ -43,7 +43,7 @@ from mattergen.common.role_partition_diffusion.oracle_partition import ContextCr
 from mattergen.diffusion.model_utils import NoiseLevelEncoding
 
 from .orbit_capacity import labels_to_bar_r, orbit_capacity_map
-from .soft_c import soft_c_from_singleton_map_and_attachment, soft_c_metrics
+from .soft_c import SOFT_C_KIND, soft_c_from_singleton_map_and_attachment, soft_c_metrics
 
 
 @dataclass
@@ -78,6 +78,7 @@ class AssignmentOutput:
     orbit_map: torch.Tensor  # bar_R [N,J]
     group_map: torch.Tensor  # G [N,K]
     c_map: torch.Tensor
+    # conditional-on-singleton-MAP structured soft C (not full-joint soft C)
     c_soft: torch.Tensor | None
     diagnostics: dict[str, Any] = field(default_factory=dict)
 

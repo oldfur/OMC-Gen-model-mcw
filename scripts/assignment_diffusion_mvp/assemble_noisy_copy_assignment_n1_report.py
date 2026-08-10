@@ -24,6 +24,19 @@ def main() -> None:
         "",
         "Assignment branch is observational only (no geometry feedback).",
         "",
+        "## Soft C definition (important)",
+        "",
+        "All soft same-copy metrics (`same_copy_pair_AUC`, Brier, etc.) use:",
+        "",
+        "> **conditional-on-singleton-MAP structured soft C**",
+        "",
+        "Construction:",
+        "1. Fix singleton copy groups to hard MAP `G_singleton`.",
+        "2. Boltzmann-average exact balanced orbit attachments conditional on that backbone.",
+        "",
+        "This is **not** full-joint structured `P(g_i=g_j)` over (tree-CRF × attachment),",
+        "and **not** an unconstrained pair-sigmoid classifier.",
+        "",
     ]
     for mode in ("oracle_orbit", "predicted_orbit"):
         path = out / f"{mode}_summary.json"

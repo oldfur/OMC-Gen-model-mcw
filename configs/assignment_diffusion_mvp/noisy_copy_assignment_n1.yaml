@@ -4,6 +4,7 @@ assignment_n1:
   freeze_gemnet_backbone: true
   noise_source: mattergen_native
   backbone_kind: context_crystal_with_t
+  # soft C = conditional-on-singleton-MAP structured soft C (not full-joint soft C)
   produce_soft_c: true
 
   orbit_modes:
@@ -13,6 +14,7 @@ assignment_n1:
   structured_decoder:
     singleton: tree_crf
     non_singleton: exact_capacity_attachment
+    # soft C kind: conditional-on-singleton-MAP structured soft C
     produce_soft_c: true
 
   loss:

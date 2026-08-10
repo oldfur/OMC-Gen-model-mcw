@@ -1,4 +1,19 @@
-"""Structured soft same-copy marginals for N1 (no unconstrained pair head)."""
+"""Conditional-on-singleton-MAP structured soft C for N1.
+
+This is **not** the full joint structured marginal over (singleton tree-CRF
+× orbit attachment).  Soft same-copy probabilities are formed by:
+
+1. fixing the singleton backbone to its hard MAP groups ``G_singleton``;
+2. taking a Boltzmann average over exact balanced orbit attachments
+   conditional on that fixed backbone.
+
+Report this object as:
+
+    conditional-on-singleton-MAP structured soft C
+
+Do not describe it as unconstrained pair-sigmoid soft C, nor as exact
+full-joint ``P(g_i=g_j)`` under the complete O2 distribution.
+"""
 from __future__ import annotations
 
 import torch
@@ -6,6 +21,9 @@ import torch
 from mattergen.assignment.global_copy_assembly.orbit_attachment import (
     enumerate_balanced_attachment_scores,
 )
+
+# Canonical name for reports / provenance (keep string stable for grep).
+SOFT_C_KIND = "conditional-on-singleton-MAP structured soft C"
 
 
 @torch.no_grad()
@@ -18,10 +36,11 @@ def soft_c_from_singleton_map_and_attachment(
     atoms_per_copy: int = 2,
     temperature: float = 1.0,
 ) -> torch.Tensor:
-    """Soft C via Boltzmann average over exact balanced attachments.
+    """Build conditional-on-singleton-MAP structured soft C.
 
-    Singleton atoms use hard MAP groups; orbit atoms use exact enumeration
-    marginals of same-copy (given fixed singleton backbone G).
+    Singleton–singleton blocks are hard indicators from ``G_singleton`` MAP.
+    Orbit–orbit (and singleton–orbit) blocks use exact enumeration marginals
+    of balanced attachments **conditioned on** that fixed singleton MAP.
     """
     n = int(G_singleton.shape[0])
     k = int(G_singleton.shape[1])
@@ -82,8 +101,8 @@ def soft_c_from_singleton_map_and_attachment(
     return C
 
 
-def soft_c_metrics(C_soft: torch.Tensor, C0: torch.Tensor) -> dict[str, float]:
-    """Simple soft same-copy metrics (off-diagonal)."""
+def soft_c_metrics(C_soft: torch.Tensor, C0: torch.Tensor) -> dict[str, float | str]:
+    """Metrics for conditional-on-singleton-MAP structured soft C (off-diagonal)."""
     off = ~torch.eye(C_soft.shape[0], dtype=torch.bool, device=C_soft.device)
     p = C_soft[off].clamp(1e-6, 1 - 1e-6)
     t = C0[off].float()
@@ -107,6 +126,7 @@ def soft_c_metrics(C_soft: torch.Tensor, C0: torch.Tensor) -> dict[str, float]:
         auc = float(((diff > 0).float() + 0.5 * (diff == 0).float()).mean())
     entropy = float((-(p * p.log() + (1 - p) * (1 - p).log())).mean())
     return {
+        "soft_C_kind": SOFT_C_KIND,
         "same_copy_pair_AUC": auc,
         "same_copy_Brier": brier,
         "same_copy_log_loss": ll,

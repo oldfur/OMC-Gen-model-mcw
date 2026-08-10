@@ -277,6 +277,11 @@ schedule.
 Default freezes the feature backbone; assignment heads reuse O2 tree-CRF +
 bitmask attachment. Does not modify pos/cell denoising scores.
 
+**Soft C naming:** N1 `c_soft` / pair-AUC metrics are
+**conditional-on-singleton-MAP structured soft C** (singleton groups fixed at
+MAP; orbit attachments marginalized exactly under that backbone). Do not call
+this full-joint structured soft \(C_t\) or unconstrained pair soft \(C\).
+
 ## Future-only output contract
 
 Authorized runs write under the configured output directory:
