@@ -1,0 +1,76 @@
+assignment_n1:
+  enabled: true
+  geometry_feedback: false
+  freeze_gemnet_backbone: true
+  noise_source: mattergen_native
+  backbone_kind: context_crystal_with_t
+  produce_soft_c: true
+
+  orbit_modes:
+    - oracle_orbit
+    - predicted_orbit
+
+  structured_decoder:
+    singleton: tree_crf
+    non_singleton: exact_capacity_attachment
+    produce_soft_c: true
+
+  loss:
+    orbit_weight: 1.0
+    singleton_tree_weight: 1.0
+    orbit_attachment_weight: 1.0
+    pair_aux_weight: 0.1
+
+  hidden_dim: 256
+  crystal_num_layers: 4
+  pair_hidden_dim: 256
+  distance_rbf_dim: 32
+  pair_score_scale: 20.0
+  limit_density: 0.05
+
+  # Fixed RHODIN01 MVP
+  fixed_sample_id: RHODIN01|4|gener|9b810e76ec9d286
+  split: val
+  seed: 17
+  steps: 2000
+  learning_rate: 5.0e-5
+  weight_decay: 1.0e-4
+  gradient_clip_norm: 1.0
+  log_every_steps: 20
+  device: auto
+
+  fixed_sample_path: outputs/assignment_diffusion_mvp/d1_fixed_clean_geometry/fixed_sample.pt
+  automorphism_orbits_path: outputs/assignment_diffusion_mvp/role_automorphism_audit/role_orbits.json
+  predicted_role_artifact_path: outputs/assignment_diffusion_mvp/global_copy_assembly_geometry_r/geometry_only_hard_r.jsonl
+  output_dir: outputs/assignment_diffusion_mvp/noisy_copy_assignment_n1
+
+  evaluation:
+    timestep_fractions:
+      - 0.00
+      - 0.02
+      - 0.05
+      - 0.10
+      - 0.20
+      - 0.30
+      - 0.40
+      - 0.50
+      - 0.60
+      - 0.70
+      - 0.80
+      - 0.90
+      - 1.00
+    seeds:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 17
+      - 42
+      - 123
+    thresholds:
+      soft_auc: 0.75
+      useful_f1: 0.8
+      reliable_f1: 0.95
+      map_gap_delta: 1.0
+      exact_c_rate: 0.9

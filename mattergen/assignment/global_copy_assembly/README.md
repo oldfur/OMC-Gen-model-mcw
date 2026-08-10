@@ -261,6 +261,22 @@ MAP top-1/top-2 margins; tie-break perturbation; optional mismatch sample.
 Writes under `.../global_copy_assembly_orbit_aware_o2/information_source_audit/`
 without overwriting O2 training metrics.
 
+## N1 — MatterGen-noisy geometry → orbit-aware assignment
+
+Observational branch only (`geometry_feedback: false`). Noise is **only** via
+MatterGen-native `MultiCorruption.sample_marginal` (pos
+`NumAtomsVarianceAdjustedWrappedVESDE`, cell `LatticeVPSDE`), not a custom
+schedule.
+
+* package: `mattergen/assignment/noisy_copy_assignment/`
+* config: `configs/assignment_diffusion_mvp/noisy_copy_assignment_n1.yaml`
+* train: `scripts/assignment_diffusion_mvp/train_noisy_copy_assignment_n1.py`
+* curves: `scripts/assignment_diffusion_mvp/evaluate_noisy_copy_assignment_curve_n1.py`
+* remote: `scripts/assignment_diffusion_mvp/run_noisy_copy_assignment_n1_remote.sh`
+
+Default freezes the feature backbone; assignment heads reuse O2 tree-CRF +
+bitmask attachment. Does not modify pos/cell denoising scores.
+
 ## Future-only output contract
 
 Authorized runs write under the configured output directory:
