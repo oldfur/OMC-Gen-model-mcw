@@ -195,8 +195,19 @@ def _balanced_attachment_log_partition(F: torch.Tensor, *, atoms_per_copy: int =
 
 
 @torch.no_grad()
-def _balanced_attachment_map(F: torch.Tensor, *, atoms_per_copy: int = 2) -> tuple[torch.Tensor, tuple[tuple[int, int], ...]]:
-    """Exact MAP under no_grad (backpointers; not needed for structured NLL grads)."""
+def _balanced_attachment_map(
+    F: torch.Tensor,
+    *,
+    atoms_per_copy: int = 2,
+    pair_order: str = "default",
+    tie_break_seed: int = 0,
+    near_tie_tol: float = 0.0,
+) -> tuple[torch.Tensor, tuple[tuple[int, int], ...]]:
+    """Exact MAP under no_grad (backpointers; not needed for structured NLL grads).
+
+    ``pair_order`` controls deterministic/random enumeration when scores tie
+    within ``near_tie_tol`` (Gate F).  Does not alter model scores.
+    """
     if F.ndim != 3 or F.shape[1] != F.shape[2]:
         raise ValueError("F must have shape [K,n,n]")
     K, n, _ = F.shape
@@ -204,6 +215,8 @@ def _balanced_attachment_map(F: torch.Tensor, *, atoms_per_copy: int = 2) -> tup
         raise ValueError(f"n={n} must equal atoms_per_copy*K={atoms_per_copy * K}")
     if atoms_per_copy != 2:
         raise NotImplementedError("MVP bitmask DP implements atoms_per_copy=2 only")
+    if pair_order not in {"default", "reverse", "random"}:
+        raise ValueError("pair_order must be default|reverse|random")
     device = F.device
     dtype = F.dtype
     n_masks = 1 << n
@@ -212,6 +225,13 @@ def _balanced_attachment_map(F: torch.Tensor, *, atoms_per_copy: int = 2) -> tup
     back_j = torch.full((K + 1, n_masks), -1, device=device, dtype=torch.long)
     max_dp[0, 0] = 0.0
     pairs = _pair_list(n)
+    if pair_order == "reverse":
+        pairs = list(reversed(pairs))
+    elif pair_order == "random":
+        g = torch.Generator(device="cpu")
+        g.manual_seed(int(tie_break_seed))
+        order = torch.randperm(len(pairs), generator=g).tolist()
+        pairs = [pairs[i] for i in order]
     for k in range(K):
         for mask in range(n_masks):
             base = max_dp[k, mask]
@@ -223,7 +243,21 @@ def _balanced_attachment_map(F: torch.Tensor, *, atoms_per_copy: int = 2) -> tup
                     continue
                 new_mask = mask | bit
                 cand = base + F[k, i, j]
-                if cand > max_dp[k + 1, new_mask]:
+                best = max_dp[k + 1, new_mask]
+                # default: strict improvement only.
+                # reverse/random: also accept near-ties so enumeration order can change MAP.
+                take = False
+                if not torch.isfinite(best) and torch.isfinite(cand):
+                    take = True
+                elif cand > best + near_tie_tol:
+                    take = True
+                elif (
+                    pair_order != "default"
+                    and torch.isfinite(best)
+                    and abs(float(cand - best)) <= near_tie_tol
+                ):
+                    take = True
+                if take:
                     max_dp[k + 1, new_mask] = cand
                     back_i[k + 1, new_mask] = i
                     back_j[k + 1, new_mask] = j
@@ -245,11 +279,104 @@ def _balanced_attachment_map(F: torch.Tensor, *, atoms_per_copy: int = 2) -> tup
     return map_score, tuple(reversed(pairs_rev))
 
 
+@torch.no_grad()
+def enumerate_balanced_attachment_scores(
+    F: torch.Tensor,
+    *,
+    atoms_per_copy: int = 2,
+) -> list[tuple[float, tuple[tuple[int, int], ...]]]:
+    """Enumerate all ordered balanced attachments with scores (exact landscape).
+
+    Returns descending ``(score, map_pairs)`` list.  For RHODIN orbit n=8,K=4
+    this is tractable (perfect matchings × K!).
+    """
+    if F.ndim != 3 or F.shape[1] != F.shape[2]:
+        raise ValueError("F must have shape [K,n,n]")
+    K, n, _ = F.shape
+    if n != atoms_per_copy * K or atoms_per_copy != 2:
+        raise ValueError("enumeration helper expects n=2K and atoms_per_copy=2")
+    atoms = list(range(n))
+
+    def perfect_matchings(items: list[int]) -> list[list[tuple[int, int]]]:
+        if not items:
+            return [[]]
+        a = items[0]
+        out: list[list[tuple[int, int]]] = []
+        for idx in range(1, len(items)):
+            b = items[idx]
+            rest = items[1:idx] + items[idx + 1 :]
+            pair = (a, b) if a < b else (b, a)
+            for matching in perfect_matchings(rest):
+                out.append([pair] + matching)
+        return out
+
+    scored: list[tuple[float, tuple[tuple[int, int], ...]]] = []
+    for matching in perfect_matchings(atoms):
+        for ordered in itertools.permutations(matching, K):
+            score = 0.0
+            for k, (i, j) in enumerate(ordered):
+                score += float(F[k, i, j].detach())
+            scored.append((score, tuple(ordered)))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored
+
+
+@torch.no_grad()
+def attachment_map_margins(
+    F: torch.Tensor,
+    *,
+    atoms_per_copy: int = 2,
+    near_tie_tol: float = 1e-6,
+    target_pairs: list[tuple[int, int]] | None = None,
+) -> dict[str, object]:
+    """Top-1 / top-2 scores, gaps, ties, logZ, optional target probability."""
+    scored = enumerate_balanced_attachment_scores(F, atoms_per_copy=atoms_per_copy)
+    if not scored:
+        raise RuntimeError("empty attachment landscape")
+    best_score, best_pairs = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else float("-inf")
+    gap = best_score - second_score if len(scored) > 1 else float("inf")
+    n_exact_ties = sum(1 for s, _ in scored if abs(s - best_score) <= 0.0)
+    n_near_ties = sum(1 for s, _ in scored if abs(s - best_score) <= near_tie_tol)
+    log_z = _balanced_attachment_log_partition(F, atoms_per_copy=atoms_per_copy)
+    log_z_f = float(log_z.detach())
+    # entropy of uniform over near-tie set is not full distribution; use full Boltzmann
+    scores_t = torch.tensor([s for s, _ in scored], dtype=F.dtype, device=F.device)
+    log_z_enum = torch.logsumexp(scores_t, dim=0)
+    probs = torch.exp(scores_t - log_z_enum)
+    entropy = float((-(probs * (scores_t - log_z_enum))).sum().clamp_min(0.0))
+    out: dict[str, object] = {
+        "best_attachment_score": best_score,
+        "second_best_attachment_score": second_score,
+        "attachment_MAP_gap": gap,
+        "map_pairs": best_pairs,
+        "logZ": log_z_f,
+        "logZ_enumeration": float(log_z_enum.detach()),
+        "entropy": entropy,
+        "number_of_exact_ties": int(n_exact_ties),
+        "number_of_near_ties": int(n_near_ties),
+        "near_tie_tol": near_tie_tol,
+        "num_complete_assignments": len(scored),
+    }
+    if target_pairs is not None:
+        tscore = 0.0
+        for k, (i, j) in enumerate(target_pairs):
+            a, b = (i, j) if i < j else (j, i)
+            tscore += float(F[k, a, b].detach())
+        out["target_score"] = tscore
+        out["target_log_probability"] = tscore - log_z_f
+        out["target_probability"] = float(torch.exp(torch.tensor(tscore - log_z_f)).clamp_max(1.0))
+    return out
+
+
 def balanced_attachment_dp(
     F: torch.Tensor,
     *,
     target_pairs: list[tuple[int, int]] | None = None,
     atoms_per_copy: int = 2,
+    pair_order: str = "default",
+    tie_break_seed: int = 0,
+    near_tie_tol: float = 0.0,
 ) -> AttachmentResult:
     """Exact balanced attachment via bitmask DP.
 
@@ -275,7 +402,13 @@ def balanced_attachment_dp(
         raise NotImplementedError("MVP bitmask DP implements atoms_per_copy=2 only")
 
     log_z = _balanced_attachment_log_partition(F, atoms_per_copy=atoms_per_copy)
-    map_score, map_pairs = _balanced_attachment_map(F, atoms_per_copy=atoms_per_copy)
+    map_score, map_pairs = _balanced_attachment_map(
+        F,
+        atoms_per_copy=atoms_per_copy,
+        pair_order=pair_order,
+        tie_break_seed=tie_break_seed,
+        near_tie_tol=near_tie_tol,
+    )
 
     target_score = None
     if target_pairs is not None:

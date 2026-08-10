@@ -248,6 +248,19 @@ Merge singleton rows and orbit rows into \(G\in\{0,1\}^{N\times K}\), enforce
 * eval: `scripts/assignment_diffusion_mvp/evaluate_global_copy_assembly_orbit_o2.py`
 * remote: `scripts/assignment_diffusion_mvp/run_global_copy_assembly_orbit_o2_remote.sh`
 
+### Information-source audit (frozen checkpoint, no training)
+
+When `correct_geometry` and `zero_geometry` both yield exact \(C\), run:
+
+* `scripts/assignment_diffusion_mvp/audit_orbit_o2_information_source.py`
+* remote: `scripts/assignment_diffusion_mvp/run_orbit_o2_information_source_audit_remote.sh`
+
+Gates: atom-index permutation equivariance; singleton \(V_r\) order shuffle;
+orbit candidate order shuffle; legacy vs strict zero geometry feature rebuild;
+MAP top-1/top-2 margins; tie-break perturbation; optional mismatch sample.
+Writes under `.../global_copy_assembly_orbit_aware_o2/information_source_audit/`
+without overwriting O2 training metrics.
+
 ## Future-only output contract
 
 Authorized runs write under the configured output directory:
