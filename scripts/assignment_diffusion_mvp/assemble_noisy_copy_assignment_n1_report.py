@@ -13,22 +13,39 @@ def main() -> None:
     args = parser.parse_args()
     out = args.output_dir
     noise = json.loads((out / "noise_process_audit.json").read_text()) if (out / "noise_process_audit.json").exists() else {}
+    prov = json.loads((out / "runtime_provenance.json").read_text()) if (out / "runtime_provenance.json").exists() else {}
     lines = [
         "# N1 Noisy Copy Assignment Report",
         "",
-        f"- noise_source: `{noise.get('noise_source')}`",
+        "## Primary experiment",
+        "",
+        "- **PRIMARY_N1** = `gemnet` (frozen pretrained molecular-CSP GemNet node embeddings)",
+        "- **ABLATION** = `context_encoder` (standalone; not run by default remote script)",
+        "",
+        f"- noise_source: `{noise.get('noise_source') or prov.get('NOISE_SOURCE')}`",
         f"- independent_noise_implementation: `{noise.get('independent_noise_implementation')}`",
+        f"- HIDDEN_SOURCE: `{prov.get('HIDDEN_SOURCE', 'gemnet_node_embeddings')}`",
+        f"- CONTEXT_CRYSTAL_ENCODER_USED: `{prov.get('CONTEXT_CRYSTAL_ENCODER_USED', False)}`",
+        f"- MATTERGEN_MODEL_PATH: `{prov.get('MATTERGEN_MODEL_PATH')}`",
+        f"- MATTERGEN_LOAD_EPOCH: `{prov.get('MATTERGEN_LOAD_EPOCH')}`",
+        f"- MATTERGEN_CHECKPOINT: `{prov.get('MATTERGEN_CHECKPOINT')}`",
+        f"- GEMNET_BACKBONE_FROZEN: `{prov.get('GEMNET_BACKBONE_FROZEN')}`",
+        f"- GEOMETRY_FEEDBACK: `{prov.get('GEOMETRY_FEEDBACK', False)}`",
+        f"- soft_c_semantics: `{prov.get('SOFT_C_SEMANTICS', 'c_soft_conditional_on_singleton_map')}`",
         f"- pos SDE: `{noise.get('pos_sde_path')}`",
         f"- cell SDE: `{noise.get('cell_sde_path')}`",
         f"- multi_corruption: `{noise.get('multi_corruption_path')}`",
         "",
         "Assignment branch is observational only (no geometry feedback).",
+        "N1 answers: do pretrained molecular-CSP GemNet hiddens already contain",
+        "decodable copy-assignment information?",
         "",
         "## Soft C definition (important)",
         "",
         "All soft same-copy metrics (`same_copy_pair_AUC`, Brier, etc.) use:",
         "",
         "> **conditional-on-singleton-MAP structured soft C**",
+        "> (`soft_c_semantics = c_soft_conditional_on_singleton_map`)",
         "",
         "Construction:",
         "1. Fix singleton copy groups to hard MAP `G_singleton`.",
@@ -36,6 +53,7 @@ def main() -> None:
         "",
         "This is **not** full-joint structured `P(g_i=g_j)` over (tree-CRF × attachment),",
         "and **not** an unconstrained pair-sigmoid classifier.",
+        "Singleton-tree uncertainty is **not** fully marginalized in this MVP.",
         "",
     ]
     for mode in ("oracle_orbit", "predicted_orbit"):

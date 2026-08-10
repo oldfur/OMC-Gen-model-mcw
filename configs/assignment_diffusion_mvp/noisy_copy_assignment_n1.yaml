@@ -3,9 +3,28 @@ assignment_n1:
   geometry_feedback: false
   freeze_gemnet_backbone: true
   noise_source: mattergen_native
-  backbone_kind: context_crystal_with_t
-  # soft C = conditional-on-singleton-MAP structured soft C (not full-joint soft C)
+
+  # PRIMARY_N1: frozen pretrained molecular-CSP GemNet node embeddings.
+  # Ablation (explicit CLI override only): hidden_source=context_encoder
+  hidden_source: gemnet
+  fail_on_gemnet_fallback: true
+
+  gemnet:
+    # Paths for remote molecular-CSP full-prior run (not mattergen_base).
+    # Override locally via --mattergen-model-path / --mattergen-load-epoch.
+    model_path: /public/home/lmy/mattergen_omc25/outputs/singlerun/2026-06-03/le50_molcsp_scratch_mean_cell025_bondhuber_lowt04_posonly_w1e-3_8gpu01234567
+    load_epoch: 294
+    checkpoint_path: /public/home/lmy/mattergen_omc25/outputs/singlerun/2026-06-03/le50_molcsp_scratch_mean_cell025_bondhuber_lowt04_posonly_w1e-3_8gpu01234567/lightning_logs/version_0/checkpoints/epoch=294-loss_val=0.04.ckpt
+    freeze_backbone: true
+    require_checkpoint: true
+    fail_on_fallback: true
+
+  context_encoder:
+    enabled: false  # ablation only when hidden_source=context_encoder
+
+  # soft C = conditional-on-singleton-MAP (not full-joint soft C)
   produce_soft_c: true
+  soft_c_semantics: c_soft_conditional_on_singleton_map
 
   orbit_modes:
     - oracle_orbit
@@ -14,7 +33,6 @@ assignment_n1:
   structured_decoder:
     singleton: tree_crf
     non_singleton: exact_capacity_attachment
-    # soft C kind: conditional-on-singleton-MAP structured soft C
     produce_soft_c: true
 
   loss:
@@ -23,6 +41,7 @@ assignment_n1:
     orbit_attachment_weight: 1.0
     pair_aux_weight: 0.1
 
+  # Assignment-head width; GemNet (512) is projected into this space.
   hidden_dim: 256
   crystal_num_layers: 4
   pair_hidden_dim: 256

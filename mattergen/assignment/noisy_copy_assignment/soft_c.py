@@ -24,6 +24,8 @@ from mattergen.assignment.global_copy_assembly.orbit_attachment import (
 
 # Canonical name for reports / provenance (keep string stable for grep).
 SOFT_C_KIND = "conditional-on-singleton-MAP structured soft C"
+# Machine-stable semantics tag (not full-joint exact structured C marginal).
+SOFT_C_SEMANTICS = "c_soft_conditional_on_singleton_map"
 
 
 @torch.no_grad()
