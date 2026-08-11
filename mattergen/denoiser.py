@@ -217,7 +217,12 @@ class GemNetTDenoiser(ScoreModel):
 
         self.element_mask_func = element_mask_func
 
-    def forward(self, x: ChemGraph, t: torch.Tensor) -> ChemGraph:
+    def forward(
+        self,
+        x: ChemGraph,
+        t: torch.Tensor,
+        soft_c_feedback: dict | None = None,
+    ) -> ChemGraph:
         """
         args:
             x: tuple containing:
@@ -227,6 +232,7 @@ class GemNetTDenoiser(ScoreModel):
                 num_atoms: (N_cryst,)
                 batch: (N_atoms,)
             t: (N_cryst,): timestep per crystal
+            soft_c_feedback: optional N2 soft-C feedback dict forwarded to GemNetT
         returns:
             tuple of:
                 predicted epsilon: (N_atoms, 3)
@@ -279,6 +285,7 @@ class GemNetTDenoiser(ScoreModel):
             to_jimages=None,
             num_bonds=None,
             node_condition=node_condition,
+            soft_c_feedback=soft_c_feedback,
         )
         pred_atom_types = self.fc_atom(output.node_embeddings)
 

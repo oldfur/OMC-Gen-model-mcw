@@ -614,6 +614,7 @@ class GemNetT(torch.nn.Module):
         num_bonds: Optional[torch.Tensor] = None,
         lattice: Optional[torch.Tensor] = None,
         node_condition: Optional[torch.Tensor] = None,
+        soft_c_feedback: Optional[dict] = None,
     ) -> ModelOutput:
         """
         args:
@@ -629,6 +630,14 @@ class GemNetT(torch.nn.Module):
             lattice: (N_cryst, 3, 3) (optional, either lengths and angles or lattice must be passed)
             node_condition: optional per-atom conditioning tensor with shape
                 (N_atoms, emb_size_atom), added after the atom/time embedding.
+            soft_c_feedback: optional N2 soft-C feedback state. When None or
+                disabled, behavior is identical to the original GemNetT forward.
+                Expected keys when enabled:
+                  enabled: bool
+                  node_delta: optional (N_atoms, emb_size_atom) residual added
+                    after atom/time embedding (before edge embedding / int blocks)
+                  edge_adapter: optional callable(m, edge_index, cell_offsets) -> Δm
+                    applied after angle_edge_emb, before interaction blocks
         returns:
             atom_frac_coords: (N_atoms, 3)
             atom_types: (N_atoms, MAX_ATOMIC_NUM)
@@ -689,12 +698,36 @@ class GemNetT(torch.nn.Module):
                 f"Expected node_condition shape {h.shape}, got {node_condition.shape}."
             )
             h = h + node_condition
+        # N2 group/node soft-C residual: after atom emb, before edge emb + interaction.
+        # Insertion: gemnet.py GemNetT.forward — post atom_latent_emb / node_condition.
+        _scf = soft_c_feedback if soft_c_feedback is not None else None
+        if _scf is not None and bool(_scf.get("enabled", False)):
+            node_delta = _scf.get("node_delta")
+            if node_delta is not None:
+                if node_delta.shape != h.shape:
+                    raise ValueError(
+                        f"soft_c_feedback.node_delta shape {tuple(node_delta.shape)} "
+                        f"!= h shape {tuple(h.shape)}"
+                    )
+                h = h + node_delta
         # (nAtoms, emb_size_atom)
         m = self.edge_emb(h, rbf, idx_s, idx_t)  # (nEdges, emb_size_edge)
         batch_edge = batch[edge_index[0]]
         cosines = torch.cosine_similarity(V_st[:, None], distorted_lattice[batch_edge], dim=-1)
         m = torch.cat([m, cosines], dim=-1)
         m = self.angle_edge_emb(m)
+        # N2 edge soft-C residual: after edge embedding, before interaction blocks.
+        # Insertion: gemnet.py GemNetT.forward — post angle_edge_emb, pre int_blocks.
+        if _scf is not None and bool(_scf.get("enabled", False)):
+            edge_adapter = _scf.get("edge_adapter")
+            if edge_adapter is not None:
+                delta_m = edge_adapter(m, edge_index, cell_offsets)
+                if delta_m.shape != m.shape:
+                    raise ValueError(
+                        f"edge_adapter residual shape {tuple(delta_m.shape)} "
+                        f"!= m shape {tuple(m.shape)}"
+                    )
+                m = m + delta_m
 
         rbf3 = self.mlp_rbf3(rbf)
         cbf3 = self.mlp_cbf3(rad_cbf3, cbf3, id3_ca, id3_ragged_idx)

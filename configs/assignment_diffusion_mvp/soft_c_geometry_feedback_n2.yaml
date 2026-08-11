@@ -1,0 +1,67 @@
+assignment_n2:
+  enabled: true
+  n2_mode: B2_combined
+  freeze_base_gemnet: true
+  geometry_feedback: true  # N2 geometry uses soft-C adapters (not assignment feedback into GemNet hidden for N1)
+  noise_source: mattergen_native
+  limit_density: 0.05
+
+  gemnet:
+    model_path: /public/home/lmy/mattergen_omc25/outputs/singlerun/2026-06-03/le50_molcsp_scratch_mean_cell025_bondhuber_lowt04_posonly_w1e-3_8gpu01234567
+    load_epoch: 294
+    checkpoint_path: /public/home/lmy/mattergen_omc25/outputs/singlerun/2026-06-03/le50_molcsp_scratch_mean_cell025_bondhuber_lowt04_posonly_w1e-3_8gpu01234567/lightning_logs/version_0/checkpoints/epoch=294-loss_val=0.04.ckpt
+
+  n1_checkpoint: outputs/assignment_diffusion_mvp/noisy_copy_assignment_n1/best_checkpoint.pt
+  n1:
+    hidden_dim: 256
+
+  soft_c_feedback:
+    enabled: true
+    edge_semantics:
+      enabled: true
+    group_context:
+      enabled: true
+    pairwise_confidence:
+      enabled: true
+    noise_gate:
+      enabled: true
+      full_on_t_fraction: 0.30
+      full_off_t_fraction: 0.60
+
+  # RHODIN01 fixed-sample MVP
+  fixed_sample_id: RHODIN01|4|gener|9b810e76ec9d286
+  split: val
+  seed: 17
+  steps: 1000
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  gradient_clip_norm: 1.0
+  log_every_steps: 20
+  device: auto
+
+  fixed_sample_path: outputs/assignment_diffusion_mvp/d1_fixed_clean_geometry/fixed_sample.pt
+  automorphism_orbits_path: outputs/assignment_diffusion_mvp/role_automorphism_audit/role_orbits.json
+  predicted_role_artifact_path: outputs/assignment_diffusion_mvp/global_copy_assembly_geometry_r/geometry_only_hard_r.jsonl
+  output_dir: outputs/assignment_diffusion_mvp/soft_c_geometry_feedback_n2
+
+  evaluation:
+    timestep_fractions:
+      - 0.00
+      - 0.10
+      - 0.20
+      - 0.30
+      - 0.40
+      - 0.50
+      - 0.60
+      - 0.80
+      - 1.00
+    # held-out seeds (not training seed 17 stream)
+    seeds:
+      - 1001
+      - 1002
+      - 1003
+      - 1004
+      - 1017
+      - 1042
+      - 1123
+      - 2026
