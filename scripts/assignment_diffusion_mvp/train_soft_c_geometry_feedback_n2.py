@@ -21,6 +21,7 @@ from mattergen.assignment.noisy_copy_assignment.mattergen_noise_adapter import (
 )
 from mattergen.assignment.soft_c_geometry_feedback_n2.geometry_loss import mattergen_geometry_loss
 from mattergen.assignment.soft_c_geometry_feedback_n2.module import SoftCGeometryFeedbackN2
+from mattergen.assignment.soft_c_geometry_feedback_n2.preflight import run_equality_preflight
 from mattergen.assignment.soft_c_geometry_feedback_n2.setup_utils import (
     build_chemgraph_batch,
     load_fixed_sample_bundle,
@@ -139,9 +140,33 @@ def main() -> None:
         print(f"{k}={runtime[k]}", flush=True)
     (out / "runtime_provenance.json").write_text(json.dumps(runtime, indent=2, default=str))
 
+    # --- Minimal baseline-equivalence preflight (fail loud before training) ---
+    pre = run_equality_preflight(
+        model=model,
+        sample=sample,
+        backbone_tree=backbone,
+        o2_target=o2_target,
+        oracle_bar=oracle_bar,
+        noise_adapter=noise,
+        seed=int(cfg.get("seed", 17)) + 999,
+    )
+    (out / "equality_preflight.json").write_text(json.dumps(pre, indent=2))
+    print(json.dumps({"event": "n2_equality_preflight", **pre}), flush=True)
+    if not pre.get("ok"):
+        raise RuntimeError(f"N2 equality preflight failed: {pre.get('failure')}")
+
     g = torch.Generator(device="cpu")
     g.manual_seed(int(cfg.get("seed", 17)))
     best_loss = float("inf")
+
+    def _module_grad_norm(module: torch.nn.Module) -> float:
+        total = 0.0
+        found = False
+        for p in module.parameters():
+            if p.grad is not None:
+                found = True
+                total += float(p.grad.detach().float().pow(2).sum().item())
+        return float(total ** 0.5) if found else 0.0
 
     with (out / "training_trace.jsonl").open("w", buffering=1) as stream:
         for step in range(steps):
@@ -169,8 +194,6 @@ def main() -> None:
             # Build ChemGraphs for native loss
             clean_cg = build_chemgraph_batch(sample, sample["pos"], sample["cell"])
             noisy_cg = build_chemgraph_batch(sample, noisy.frac_coords_t, noisy.lattice_t)
-            # Move batch fields to device
-            # PyG Batch already on correct device if tensors were
             opt.zero_grad(set_to_none=True)
             score_out = model.forward_geometry(
                 chemgraph=noisy_cg,
@@ -197,6 +220,22 @@ def main() -> None:
             for p in model.denoiser.parameters():
                 if p.grad is not None and float(p.grad.abs().sum()) != 0:
                     raise RuntimeError("FROZEN_BASE_GEMNET_VIOLATION: base GemNet received gradients")
+            edge_gn = _module_grad_norm(model.edge_adapter)
+            group_gn = _module_grad_norm(model.group_adapter)
+            g_noise = float(model._last_diag.g_noise) if model._last_diag else None
+            # When feedback is active (g_noise>0), at least the enabled adapter path
+            # should receive geometry-loss gradient (log always; fail if none).
+            if g_noise is not None and g_noise > 0.0 and soft_c is not None:
+                if mode == "B2_combined" and edge_gn <= 0.0 and group_gn <= 0.0:
+                    raise RuntimeError(
+                        f"both adapter grad norms are 0 at step={step} with g_noise={g_noise}>0"
+                    )
+                if mode == "B3_edge_only" and edge_gn <= 0.0:
+                    raise RuntimeError(
+                        f"edge_adapter_grad_norm=0 at step={step} with g_noise={g_noise}>0"
+                    )
+                # B4 group-only may legitimately have ~0 grad when group mass is 0;
+                # still log group_adapter_grad_norm every step.
             gn = torch.nn.utils.clip_grad_norm_(params, clip)
             opt.step()
 
@@ -209,8 +248,10 @@ def main() -> None:
                 "log_snr_x": float(noisy.log_snr_x),
                 "geometry_loss": float(loss.detach()),
                 "gradient_norm": float(gn),
+                "edge_adapter_grad_norm": edge_gn,
+                "group_adapter_grad_norm": group_gn,
                 "n2_mode": mode,
-                "g_noise": (model._last_diag.g_noise if model._last_diag else None),
+                "g_noise": g_noise,
                 **{f"loss_{k}": v for k, v in metrics.items()},
             }
             stream.write(json.dumps(row) + "\n")

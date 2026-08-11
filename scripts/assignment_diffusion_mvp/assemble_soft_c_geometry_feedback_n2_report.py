@@ -50,27 +50,32 @@ def main() -> None:
         "",
         "## Ablation summary (paired Δloss vs B0; negative = better)",
         "",
-        "| t/T | B0 loss | ΔB2 combined | ΔB3 edge | ΔB4 group | ΔB5 shuffled | B1≡B0 |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| t/T | B0 loss | Imp B2 | Imp B3 | Imp B4 | Imp B5 (orbit-shuf) | B2>B5 rate | B1≡B0 |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for s in summary:
         lines.append(
-            f"| {s.get('t_fraction')} | {s.get('mean_loss_B0')} | {s.get('mean_delta_B2')} | "
-            f"{s.get('mean_delta_B3')} | {s.get('mean_delta_B4')} | {s.get('mean_delta_B5')} | "
-            f"{s.get('b1_match_rate')} |"
+            f"| {s.get('t_fraction')} | {s.get('mean_loss_B0')} | "
+            f"{s.get('mean_improvement_B2', s.get('mean_delta_B2'))} | "
+            f"{s.get('mean_improvement_B3', s.get('mean_delta_B3'))} | "
+            f"{s.get('mean_improvement_B4', s.get('mean_delta_B4'))} | "
+            f"{s.get('mean_improvement_B5', s.get('mean_delta_B5'))} | "
+            f"{s.get('b2_beats_b5_rate')} | {s.get('b1_match_rate')} |"
         )
     lines += [
         "",
-        f"- overall mean ΔB2: `{ab.get('overall_mean_delta_B2')}`",
-        f"- overall mean ΔB5 (shuffled): `{ab.get('overall_mean_delta_B5_shuffled')}`",
+        f"- B5 shuffle kind: `{ab.get('b5_shuffle_kind', 'orbit_preserving')}`",
+        f"- overall mean improvement B2 (= L_B0−L_B2): `{ab.get('overall_mean_improvement_B2', ab.get('overall_mean_delta_B2'))}`",
+        f"- overall mean improvement B5: `{ab.get('overall_mean_improvement_B5', ab.get('overall_mean_delta_B5_shuffled'))}`",
         "",
         "## Interpretation checklist",
         "",
         "1. Soft C is geometry-induced per timestep (not G diffusion).",
         "2. Soft C is stop-grad into geometry loss.",
         "3. B1 (no feedback) must match B0 geometry scores.",
-        "4. If B2 improves but B5 shuffled does not, copy structure is causal.",
+        "4. Support claim only if Imp(B2)>0 **and** L_B2 < L_B5 (orbit-preserving shuffle).",
         "5. High-noise (t/T≥0.6) gate should null feedback.",
+        "6. Improvement = L_B0 − L_mode (positive = better).",
         "",
     ]
     (out / "n2_report.md").write_text("\n".join(lines) + "\n")

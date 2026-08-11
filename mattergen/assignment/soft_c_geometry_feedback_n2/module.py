@@ -38,7 +38,7 @@ from .adapters import SoftCEdgeAdapter, SoftCGroupAdapter
 from .feedback import (
     build_edge_soft_c_channels,
     expected_same_copy_representation,
-    shuffle_soft_c,
+    orbit_preserving_shuffle_soft_c,
 )
 from .gates import NoiseGateConfig, noise_gate_value
 
@@ -276,12 +276,29 @@ class SoftCGeometryFeedbackN2(nn.Module):
         if soft_c is not None:
             soft_c = soft_c.detach()
             if flags["shuffle"]:
-                soft_c = shuffle_soft_c(soft_c)
-                meta["soft_c_source"] = "shuffled_n1"
+                # Orbit labels from oracle bar_R (orbit capacity structure), not global atom shuffle.
+                orbit_labels = oracle_bar.argmax(dim=-1).long()
+                soft_c = orbit_preserving_shuffle_soft_c(soft_c, orbit_labels)
+                meta["soft_c_source"] = "orbit_preserving_shuffled_n1"
+                meta["shuffle_kind"] = "orbit_preserving"
             soft_c = soft_c.clamp(0.0, 1.0)
             soft_c.fill_diagonal_(1.0)
         h_ret = h_a_raw if h_a_raw is not None else h_a_out.detach()
         return soft_c, h_ret, meta
+
+    def apply_orbit_preserving_shuffle(
+        self,
+        soft_c: torch.Tensor,
+        oracle_bar: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Public helper for eval: orbit-preserving B5 shuffle of a shared soft C."""
+        orbit_labels = oracle_bar.argmax(dim=-1).long()
+        out = orbit_preserving_shuffle_soft_c(soft_c.detach(), orbit_labels, generator=generator)
+        out = out.clamp(0.0, 1.0)
+        out.fill_diagonal_(1.0)
+        return out
 
     # ------------------------------------------------------------------ Pass B
     def _build_soft_c_feedback_state(

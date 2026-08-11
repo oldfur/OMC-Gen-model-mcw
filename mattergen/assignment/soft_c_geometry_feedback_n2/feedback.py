@@ -32,12 +32,81 @@ class EdgeFeedbackAudit:
 
 
 def shuffle_soft_c(c: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-    """Atom-permutation shuffle: C' = P C P^T (destroys pair correspondence)."""
+    """Legacy global atom shuffle: C' = P C P^T.
+
+    Prefer :func:`orbit_preserving_shuffle_soft_c` for B5 control.
+    """
     n = c.shape[0]
     if generator is None:
         perm = torch.randperm(n, device=c.device)
     else:
         perm = torch.randperm(n, generator=generator, device="cpu").to(c.device)
+    return c[perm][:, perm]
+
+
+def orbit_preserving_shuffle_soft_c(
+    c: torch.Tensor,
+    orbit_labels: torch.Tensor,
+    *,
+    generator: torch.Generator | None = None,
+    max_attempts: int = 64,
+) -> torch.Tensor:
+    """Orbit-preserving soft-C shuffle for B5 control.
+
+    For each orbit o with atom set V_o, draw an independent permutation
+    σ_o : V_o → V_o and compose into a global permutation P. Then
+
+        C_shuffle = P C P^T   (implemented as C[perm][:, perm]
+                               with perm[i] = σ(i))
+
+    Geometry and H^A are left untouched by the caller; only soft-C atom-pair
+    correspondence is broken. Permutations never mix different orbits.
+
+    Avoids the identity / no-op permutation when at least one orbit has |V_o|≥2.
+    """
+    if c.ndim != 2 or c.shape[0] != c.shape[1]:
+        raise ValueError(f"soft C must be square, got {tuple(c.shape)}")
+    n = int(c.shape[0])
+    labels = orbit_labels.long().reshape(-1).to(device="cpu")
+    if labels.numel() != n:
+        raise ValueError(f"orbit_labels length {labels.numel()} != N={n}")
+
+    orbit_ids = sorted({int(x) for x in labels.tolist()})
+    shufflable = [o for o in orbit_ids if int((labels == o).sum()) >= 2]
+    if not shufflable:
+        raise RuntimeError(
+            "orbit_preserving_shuffle_soft_c: no orbit with size>=2; cannot break copy correspondence"
+        )
+
+    def _draw_perm() -> torch.Tensor:
+        perm = torch.arange(n, dtype=torch.long)
+        for o in orbit_ids:
+            idx = torch.nonzero(labels == o, as_tuple=False).flatten()
+            k = int(idx.numel())
+            if k <= 1:
+                continue
+            if generator is None:
+                local = torch.randperm(k)
+            else:
+                local = torch.randperm(k, generator=generator)
+            perm[idx] = idx[local]
+        return perm
+
+    identity = torch.arange(n, dtype=torch.long)
+    perm = _draw_perm()
+    attempts = 1
+    while torch.equal(perm, identity) and attempts < max_attempts:
+        perm = _draw_perm()
+        attempts += 1
+    if torch.equal(perm, identity):
+        # Force a non-trivial swap inside the largest orbit
+        o_big = max(shufflable, key=lambda o: int((labels == o).sum()))
+        idx = torch.nonzero(labels == o_big, as_tuple=False).flatten()
+        perm = identity.clone()
+        perm[idx[0]], perm[idx[1]] = idx[1].item(), idx[0].item()
+
+    perm = perm.to(device=c.device)
+    # C'[i,j] = C[σ(i), σ(j)]
     return c[perm][:, perm]
 
 

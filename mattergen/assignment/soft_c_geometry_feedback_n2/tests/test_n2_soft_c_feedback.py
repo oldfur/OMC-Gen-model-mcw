@@ -14,6 +14,7 @@ from mattergen.assignment.soft_c_geometry_feedback_n2.adapters import (
 from mattergen.assignment.soft_c_geometry_feedback_n2.feedback import (
     build_edge_soft_c_channels,
     expected_same_copy_representation,
+    orbit_preserving_shuffle_soft_c,
     shuffle_soft_c,
 )
 from mattergen.assignment.soft_c_geometry_feedback_n2.gates import (
@@ -112,6 +113,32 @@ def test_shuffle_soft_c_preserves_symmetry_and_values():
     assert torch.allclose(Cs, Cs.T, atol=1e-6)
     # multiset of off-diagonal values preserved under simultaneous row/col perm
     assert torch.allclose(torch.sort(C.flatten())[0], torch.sort(Cs.flatten())[0])
+
+
+def test_orbit_preserving_shuffle_stays_within_orbits():
+    """B5: permute only inside each orbit; keep value multiset; not identity."""
+    # Two orbits of size 3: labels [0,0,0,1,1,1]
+    n = 6
+    labels = torch.tensor([0, 0, 0, 1, 1, 1])
+    C = torch.rand(n, n)
+    C = 0.5 * (C + C.T)
+    C.fill_diagonal_(1.0)
+    g = torch.Generator().manual_seed(1)
+    Cs = orbit_preserving_shuffle_soft_c(C, labels, generator=g)
+    assert torch.allclose(Cs, Cs.T, atol=1e-6)
+    assert torch.allclose(torch.sort(C.flatten())[0], torch.sort(Cs.flatten())[0])
+    # Not a pure global reordering of unrelated orbits: block structure of
+    # which *positions* hold orbit-internal mass can change, but identity is forbidden.
+    assert not torch.allclose(Cs, C)
+    # Singleton orbit must be fixed: add singleton and check position 6
+    labels2 = torch.tensor([0, 0, 0, 1, 1, 1, 2])
+    C2 = torch.eye(7)
+    C2[0, 1] = C2[1, 0] = 0.8
+    C2[3, 4] = C2[4, 3] = 0.7
+    g2 = torch.Generator().manual_seed(2)
+    Cs2 = orbit_preserving_shuffle_soft_c(C2, labels2, generator=g2)
+    # Diagonal stays 1
+    assert torch.allclose(torch.diag(Cs2), torch.ones(7))
 
 
 def test_gemnet_forward_accepts_soft_c_feedback_kwarg():
