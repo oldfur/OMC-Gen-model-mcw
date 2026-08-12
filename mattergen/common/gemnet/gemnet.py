@@ -721,7 +721,9 @@ class GemNetT(torch.nn.Module):
         if _scf is not None and bool(_scf.get("enabled", False)):
             edge_adapter = _scf.get("edge_adapter")
             if edge_adapter is not None:
-                delta_m = edge_adapter(m, edge_index, cell_offsets)
+                # generate_interaction_graph returns PBC offsets as last value,
+                # unpacked as to_jimages (same tensor as cell_offsets in reorder path).
+                delta_m = edge_adapter(m, edge_index, to_jimages)
                 if delta_m.shape != m.shape:
                     raise ValueError(
                         f"edge_adapter residual shape {tuple(delta_m.shape)} "
