@@ -117,6 +117,10 @@ def joint_training_step_losses(
     lambda_g: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Geometry branch uses A_s; assignment reverse NLL on segment with fixed X_t,L_t."""
+    # NoiseLevelEncoding requires 1D batch time: shape [B], not scalar 0-dim.
+    t = torch.as_tensor(t, dtype=torch.float32).reshape(-1)
+    if noisy_cg["pos"].device.type != "cpu":
+        t = t.to(device=noisy_cg["pos"].device)
     # geometry with A_s (cleaner assignment for A-first Lie)
     geom_out = model(noisy_cg, t, state_for_geometry, compute_jumps=False)
     L_geom, metrics = mattergen_geometry_loss(
@@ -125,7 +129,7 @@ def joint_training_step_losses(
         clean_batch=clean_cg,
         noisy_batch=noisy_cg,
         score_model_output=geom_out.chemgraph_scores,
-        t=t.reshape(-1),
+        t=t,
     )
     nll = reverse_ctmc_segment_nll(
         model=model,

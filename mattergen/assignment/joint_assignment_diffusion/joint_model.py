@@ -174,7 +174,9 @@ class JointAXLModel(nn.Module):
         *,
         compute_jumps: bool = True,
     ) -> JointModelOutput:
-        t_scalar = float(t.reshape(-1)[0].item())
+        # NoiseLevelEncoding expects t.shape == [batch_size], not a 0-dim scalar.
+        t = torch.as_tensor(t, device=chemgraph["pos"].device, dtype=torch.float32).reshape(-1)
+        t_scalar = float(t[0].item())
         scf, meta = self._build_a_feedback(state, t_scalar=t_scalar)
         scores = self.denoiser(chemgraph, t, soft_c_feedback=scf)
         # Recover node embeddings via a second light path: use GemNet hidden from feedback
