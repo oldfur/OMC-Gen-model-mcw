@@ -14,6 +14,13 @@ class SymmetryAugment:
     copy_perm: torch.Tensor  # [K] long
 
 
+def _randperm(n: int, *, device: torch.device, generator: torch.Generator | None) -> torch.Tensor:
+    """torch.randperm with generator always materializes on CPU; move to ``device``."""
+    if generator is None:
+        return torch.randperm(n, device=device)
+    return torch.randperm(n, generator=generator).to(device=device)
+
+
 def sample_symmetry_augment(
     *,
     atomic_numbers: torch.Tensor,
@@ -28,27 +35,24 @@ def sample_symmetry_augment(
         idx = (atomic_numbers == z).nonzero(as_tuple=False).flatten()
         if idx.numel() <= 1:
             continue
-        if generator is None:
-            local = torch.randperm(idx.numel(), device=device)
-        else:
-            local = torch.randperm(idx.numel(), generator=generator)
+        local = _randperm(int(idx.numel()), device=device, generator=generator)
         atom_perm[idx] = idx[local]
-    if generator is None:
-        copy_perm = torch.randperm(K, device=device)
-    else:
-        copy_perm = torch.randperm(K, generator=generator)
+    copy_perm = _randperm(int(K), device=device, generator=generator)
     return SymmetryAugment(atom_perm=atom_perm, copy_perm=copy_perm)
 
 
 def apply_symmetry_to_state(state: JointAssignmentState, aug: SymmetryAugment) -> JointAssignmentState:
     """Permute atoms then copy columns: same physical crystal, different gauge."""
-    A = state.A[aug.atom_perm]  # atom axis
-    A = A[:, :, aug.copy_perm]  # copy columns
+    device = state.A.device
+    atom_perm = aug.atom_perm.to(device=device)
+    copy_perm = aug.copy_perm.to(device=device)
+    A = state.A[atom_perm]  # atom axis
+    A = A[:, :, copy_perm]  # copy columns
     return JointAssignmentState(
         A=A,
         partition=state.partition,
-        atomic_numbers=state.atomic_numbers[aug.atom_perm],
-        element_by_orbit=state.element_by_orbit,
+        atomic_numbers=state.atomic_numbers[atom_perm],
+        element_by_orbit=state.element_by_orbit.to(device=device),
     )
 
 
@@ -60,15 +64,18 @@ def apply_symmetry_to_geometry(
     copy: torch.Tensor | None,
     aug: SymmetryAugment,
 ) -> dict[str, torch.Tensor]:
+    device = frac.device
+    atom_perm = aug.atom_perm.to(device=device)
+    copy_perm = aug.copy_perm.to(device=device)
     out = {
-        "pos": frac[aug.atom_perm],
-        "z": atomic_numbers[aug.atom_perm],
+        "pos": frac[atom_perm],
+        "z": atomic_numbers[atom_perm],
     }
     if role is not None:
-        out["role"] = role[aug.atom_perm]
+        out["role"] = role.to(device=device)[atom_perm]
     if copy is not None:
         # copy labels remap by inverse of copy_perm
-        inv = torch.empty_like(aug.copy_perm)
-        inv[aug.copy_perm] = torch.arange(aug.copy_perm.numel(), device=aug.copy_perm.device)
-        out["copy"] = inv[copy[aug.atom_perm]]
+        inv = torch.empty_like(copy_perm)
+        inv[copy_perm] = torch.arange(copy_perm.numel(), device=device)
+        out["copy"] = inv[copy.to(device=device)[atom_perm]]
     return out
