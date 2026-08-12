@@ -225,12 +225,26 @@ def main() -> None:
                 t=t,
                 generator=g,
             )
-            # sample dict for chemgraph uses augmented atoms
+            # sample dict for chemgraph uses augmented atoms + mol_* for molecule_conditioner
             samp_aug = dict(sample_d)
             samp_aug["z"] = geo["z"]
             samp_aug["pos"] = geo["pos"]
-            clean_cg = build_cg(samp_aug, geo["pos"], sample_d["cell"])
-            noisy_cg = build_cg(samp_aug, noisy.frac_coords_t, noisy.lattice_t)
+            if "role" in geo:
+                samp_aug["role"] = geo["role"]
+            if "copy" in geo:
+                samp_aug["copy"] = geo["copy"]
+            # Reconstruct mol graph on augmented role/copy (atom order already permuted)
+            mol_extra = build_mol_conditioning_from_sample(
+                {
+                    "z": samp_aug["z"],
+                    "role": samp_aug.get("role", sample_d["role"]),
+                    "copy": samp_aug.get("copy", sample_d["copy"]),
+                    "role_edge_index": sample_d["role_edge_index"],
+                    "role_bond_type": sample_d["role_bond_type"],
+                }
+            )
+            clean_cg = build_cg(samp_aug, geo["pos"], sample_d["cell"], extra_mol=mol_extra)
+            noisy_cg = build_cg(samp_aug, noisy.frac_coords_t, noisy.lattice_t, extra_mol=mol_extra)
 
             opt.zero_grad(set_to_none=True)
             losses = joint_training_step_losses(
