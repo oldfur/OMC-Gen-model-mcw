@@ -228,7 +228,8 @@ class JointAXLModel(nn.Module):
             x["num_atoms"],
             x.get_batch_idx("pos"),
         )
-        t_enc = self.denoiser.noise_level_encoding(t.reshape(-1)).to(lattice.device)
+        t = torch.as_tensor(t, device=lattice.device, dtype=torch.float32).reshape(-1)
+        t_enc = self.denoiser.noise_level_encoding(t).to(lattice.device)
         z_per = t_enc
         prop = get_property_embeddings(batch=x, property_embeddings=self.denoiser.property_embeddings)
         if len(prop) > 0:
