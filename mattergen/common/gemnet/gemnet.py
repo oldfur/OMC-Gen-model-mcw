@@ -768,6 +768,11 @@ class GemNetT(torch.nn.Module):
                 idx_s=idx_s,
                 idx_t=idx_t,
             )  # (nAtoms, emb_size_atom), (nEdges, emb_size_edge)
+            # Optional joint-assignment / N2 mid-block node fusion (residual).
+            if _scf is not None and bool(_scf.get("enabled", False)):
+                mid_fn = _scf.get("mid_block_node_fn")
+                if mid_fn is not None:
+                    h = h + mid_fn(h, i)
 
             E, F = self.out_blocks[i + 1](h, m, rbf_out, idx_t)
             # (nAtoms, num_targets), (nEdges, num_targets)
