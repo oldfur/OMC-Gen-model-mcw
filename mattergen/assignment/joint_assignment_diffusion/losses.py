@@ -1,11 +1,15 @@
-"""Joint losses: MatterGen geometry + reverse CTMC point-process NLL for R/G."""
+"""Joint losses: MatterGen geometry + categorical reverse jump NLL (fixed hazard)."""
 from __future__ import annotations
+
+import math
+from typing import Any
 
 import torch
 
 from mattergen.assignment.soft_c_geometry_feedback_n2.geometry_loss import mattergen_geometry_loss
 
 from .ctmc import CTMCTrajectory
+from .jump_heads import jump_pool_diagnostics, logits_to_pi
 from .legal_moves import LegalMove, apply_move
 from .state import JointAssignmentState
 
@@ -14,90 +18,124 @@ def _pair_key(i: int, j: int) -> tuple[int, int]:
     return (i, j) if i < j else (j, i)
 
 
-def _rate_mass(rates: list, *, device, dtype=torch.float32) -> torch.Tensor:
-    """Σ r_m over move pool; empty → 0 (same NLL as skipping empty pools)."""
-    if not rates:
-        return torch.zeros((), device=device, dtype=dtype)
-    return torch.stack([r for _, r in rates]).sum()
-
-
-def reverse_ctmc_segment_nll(
+def reverse_categorical_jump_nll(
     *,
     model,
     chemgraph_t,
-    t_start: float,
-    t_end: float,
     traj: CTMCTrajectory,
     t_geom: torch.Tensor,
+    kinds: tuple[str, ...] = ("R", "G"),
     clip: float = 8.0,
-    n_quad: int = 4,
-) -> dict[str, torch.Tensor]:
-    """Reverse-rate point-process NLL on forward segment [t_start, t_end].
+) -> dict[str, torch.Tensor | float | int]:
+    """Legal categorical NLL on reverse CTMC events (fixed total hazard).
 
-    Forward events are reversed: integrating from t_end → t_start with
-    reverse rates evaluated at fixed (X_t, L_t) geometry (A-first Lie).
+    Survival ∫λ is parameter-free when Σ r = β(t). Training only fits
+    π_m = softmax(ℓ) on observed reverse swaps:
 
-    L = ∫ λ_θ dτ − Σ log r_m(τ_e)  (for reverse events).
+        L_a = - Σ_{e ∈ a} log π^a_{m_e}
 
-    Engineering only: dict rate lookup; same quadrature / event semantics.
+    Also reports uniform baseline L_a^uniform = Σ log |M_a| and ΔL = L - L_uniform.
     """
     device = t_geom.device
-    # collect reverse events in (s,t] = (t_start, t_end]
-    rev_events = [e for e in traj.events if t_start < e.time <= t_end]
-    # reverse order
-    rev_events = list(reversed(rev_events))
+    rev_events = list(reversed(list(traj.events)))
 
-    # Survival / integrated rate: midpoint quadrature on reverse time
-    # reverse time u from 0..Δ maps to forward time t_end - u
-    delta = t_end - t_start
-    if delta <= 0:
-        z = torch.zeros((), device=device)
-        return {"L_R": z, "L_G": z, "L_A": z}
+    zero = torch.zeros((), device=device)
+    L = {k: zero.clone() for k in ("R", "G")}
+    L_uni = {k: 0.0 for k in ("R", "G")}
+    n_ev = {k: 0 for k in ("R", "G")}
+    n_miss = {k: 0 for k in ("R", "G")}
+    last_diag: dict[str, Any] = {}
 
-    integrated_r = torch.zeros((), device=device)
-    integrated_g = torch.zeros((), device=device)
-    du = delta / n_quad
-    for q in range(n_quad):
-        # midpoint
-        u = (q + 0.5) * du
-        t_fwd = t_end - u
-        # state just after reverse progress: walk reverse events
-        # approx: use traj.state_at(t_fwd)
-        st = traj.state_at(t_fwd)
-        out = model(chemgraph_t, t_geom, st, compute_jumps=True)
-        integrated_r = integrated_r + _rate_mass(out.move_rates.get("R", []), device=device) * du
-        integrated_g = integrated_g + _rate_mass(out.move_rates.get("G", []), device=device) * du
+    if not rev_events:
+        return {
+            "L_R": L["R"],
+            "L_G": L["G"],
+            "L_A": L["R"] + L["G"],
+            "L_R_uniform": 0.0,
+            "L_G_uniform": 0.0,
+            "delta_L_R": 0.0,
+            "delta_L_G": 0.0,
+            "n_R_events": 0,
+            "n_G_events": 0,
+            "n_R_miss": 0,
+            "n_G_miss": 0,
+            **last_diag,
+        }
 
-    # event log-likelihood (reverse)
-    log_r = torch.zeros((), device=device)
-    log_g = torch.zeros((), device=device)
-    # reverse path states: start from traj.state_at(t_end)
-    st = traj.state_at(t_end).clone()
+    # Reverse path from end state
+    st = traj.state_at(1.0).clone() if traj.times[-1] >= 1.0 - 1e-9 else traj.states[-1].clone()
+    # Prefer explicit end: last state after all events
+    st = traj.states[-1].clone()
     pen = torch.tensor(20.0, device=device)
+
     for e in rev_events:
-        # reverse event undoes forward swap: same swap
-        out = model(chemgraph_t, t_geom, st, compute_jumps=True)
         kind = e.kind
-        # O(1) pair lookup instead of linear scan over move list
-        rate_map = {_pair_key(m.i, m.j): r for m, r in out.move_rates.get(kind, [])}
-        found = rate_map.get(_pair_key(e.i, e.j))
-        if found is None:
-            # illegal under reverse state — large penalty
-            if kind == "R":
-                log_r = log_r - pen
+        if kind in kinds:
+            out = model(chemgraph_t, t_geom, st, compute_jumps=True)
+            scored = out.move_logits
+            pi_pool = logits_to_pi(scored, clip=clip).get(kind, [])
+            n_legal = len(pi_pool)
+            last_diag.update(
+                jump_pool_diagnostics(
+                    scored,
+                    beta_r=float(out.diagnostics.get("beta_r", 0.0)),
+                    beta_g=float(out.diagnostics.get("beta_g", 0.0)),
+                    clip=clip,
+                )
+            )
+            pi_map = {_pair_key(m.i, m.j): p for m, p in pi_pool}
+            found = pi_map.get(_pair_key(e.i, e.j))
+            n_ev[kind] += 1
+            if n_legal > 0:
+                L_uni[kind] += math.log(n_legal)
+            if found is None:
+                n_miss[kind] += 1
+                L[kind] = L[kind] + pen
             else:
-                log_g = log_g - pen
-        else:
-            log_term = torch.log(found.clamp_min(1e-12))
-            if kind == "R":
-                log_r = log_r + log_term
-            else:
-                log_g = log_g + log_term
+                L[kind] = L[kind] - torch.log(found.clamp_min(1e-12))
+        # Always apply reverse swap so mixed R/G path stays consistent
         st = apply_move(st, LegalMove(kind, e.i, e.j))
 
-    L_R = integrated_r - log_r
-    L_G = integrated_g - log_g
-    return {"L_R": L_R, "L_G": L_G, "L_A": L_R + L_G}
+    def _delta(kind: str) -> float:
+        # L is tensor; detach for scalar report
+        return float(L[kind].detach()) - L_uni[kind]
+
+    return {
+        "L_R": L["R"],
+        "L_G": L["G"],
+        "L_A": L["R"] + L["G"],
+        "L_R_uniform": L_uni["R"],
+        "L_G_uniform": L_uni["G"],
+        "delta_L_R": _delta("R"),
+        "delta_L_G": _delta("G"),
+        "n_R_events": n_ev["R"],
+        "n_G_events": n_ev["G"],
+        "n_R_miss": n_miss["R"],
+        "n_G_miss": n_miss["G"],
+        **{k: v for k, v in last_diag.items() if not torch.is_tensor(v)},
+    }
+
+
+def assignment_kind_nll(
+    *,
+    model,
+    chemgraph,
+    t_geom: torch.Tensor,
+    traj: CTMCTrajectory,
+    kind: str,
+    clip: float = 8.0,
+) -> dict[str, torch.Tensor | float | int]:
+    """Single-kind reverse categorical NLL (active-window training call)."""
+    full = reverse_categorical_jump_nll(
+        model=model,
+        chemgraph_t=chemgraph,
+        traj=traj,
+        t_geom=t_geom,
+        kinds=(kind,),
+        clip=clip,
+    )
+    # zero out the other kind's contribution in returned L_* tensors already only kind events
+    return full
 
 
 def joint_training_step_losses(
@@ -106,43 +144,87 @@ def joint_training_step_losses(
     loss_fn,
     corruption,
     clean_cg,
-    noisy_cg,
-    t: torch.Tensor,
+    noisy_cg_geom,
+    t_geom: torch.Tensor,
     state_for_geometry: JointAssignmentState,
     traj: CTMCTrajectory,
-    t_s: float,
-    t_t: float,
+    noisy_cg_r=None,
+    t_r: torch.Tensor | None = None,
+    noisy_cg_g=None,
+    t_g: torch.Tensor | None = None,
     lambda_r: float = 1.0,
     lambda_g: float = 1.0,
 ) -> dict[str, torch.Tensor]:
-    """Geometry branch uses A_s; assignment reverse NLL on segment with fixed X_t,L_t."""
-    # NoiseLevelEncoding requires 1D batch time: shape [B], not scalar 0-dim.
-    t = torch.as_tensor(t, dtype=torch.float32).reshape(-1)
-    if noisy_cg["pos"].device.type != "cpu":
-        t = t.to(device=noisy_cg["pos"].device)
-    # geometry with A_s (cleaner assignment for A-first Lie)
-    geom_out = model(noisy_cg, t, state_for_geometry, compute_jumps=False)
+    """Geometry at t_X ~ U; assignment categorical NLL at active t_R / t_G.
+
+    Survival hazard is constant w.r.t. parameters (Σ r = β). Only π is trained.
+    """
+    t_geom = torch.as_tensor(t_geom, dtype=torch.float32).reshape(-1)
+    if noisy_cg_geom["pos"].device.type != "cpu":
+        t_geom = t_geom.to(device=noisy_cg_geom["pos"].device)
+
+    geom_out = model(noisy_cg_geom, t_geom, state_for_geometry, compute_jumps=False)
     L_geom, metrics = mattergen_geometry_loss(
         loss_fn=loss_fn,
         corruption=corruption,
         clean_batch=clean_cg,
-        noisy_batch=noisy_cg,
+        noisy_batch=noisy_cg_geom,
         score_model_output=geom_out.chemgraph_scores,
-        t=t,
+        t=t_geom,
     )
-    nll = reverse_ctmc_segment_nll(
-        model=model,
-        chemgraph_t=noisy_cg,
-        t_start=t_s,
-        t_end=t_t,
-        traj=traj,
-        t_geom=t,
-    )
-    total = L_geom + lambda_r * nll["L_R"] + lambda_g * nll["L_G"]
-    return {
+
+    device = L_geom.device
+    # R head: geometry at t_R (active), reverse categorical on R events
+    if noisy_cg_r is None or t_r is None:
+        nll_r = reverse_categorical_jump_nll(
+            model=model, chemgraph_t=noisy_cg_geom, traj=traj, t_geom=t_geom, kinds=("R",)
+        )
+    else:
+        t_r = torch.as_tensor(t_r, dtype=torch.float32, device=device).reshape(-1)
+        nll_r = reverse_categorical_jump_nll(
+            model=model, chemgraph_t=noisy_cg_r, traj=traj, t_geom=t_r, kinds=("R",)
+        )
+
+    if noisy_cg_g is None or t_g is None:
+        nll_g = reverse_categorical_jump_nll(
+            model=model, chemgraph_t=noisy_cg_geom, traj=traj, t_geom=t_geom, kinds=("G",)
+        )
+    else:
+        t_g = torch.as_tensor(t_g, dtype=torch.float32, device=device).reshape(-1)
+        nll_g = reverse_categorical_jump_nll(
+            model=model, chemgraph_t=noisy_cg_g, traj=traj, t_geom=t_g, kinds=("G",)
+        )
+
+    L_R = nll_r["L_R"]
+    L_G = nll_g["L_G"]
+    total = L_geom + lambda_r * L_R + lambda_g * L_G
+
+    out: dict[str, torch.Tensor] = {
         "loss": total,
         "L_geom": L_geom,
-        "L_R": nll["L_R"],
-        "L_G": nll["L_G"],
-        **{f"geom_{k}": torch.tensor(v, device=L_geom.device) if not torch.is_tensor(v) else v for k, v in metrics.items()},
+        "L_R": L_R,
+        "L_G": L_G,
+        "L_R_uniform": torch.tensor(float(nll_r["L_R_uniform"]), device=device),
+        "L_G_uniform": torch.tensor(float(nll_g["L_G_uniform"]), device=device),
+        "delta_L_R": torch.tensor(float(nll_r["delta_L_R"]), device=device),
+        "delta_L_G": torch.tensor(float(nll_g["delta_L_G"]), device=device),
+        "n_R_events": torch.tensor(float(nll_r["n_R_events"]), device=device),
+        "n_G_events": torch.tensor(float(nll_g["n_G_events"]), device=device),
     }
+    for k, v in metrics.items():
+        out[f"geom_{k}"] = torch.tensor(v, device=device) if not torch.is_tensor(v) else v
+    # optional last-event diagnostics (scalars)
+    for src, prefix in ((nll_r, "r"), (nll_g, "g")):
+        for key in (
+            f"num_R_moves",
+            f"num_G_moves",
+            f"logit_mean_R",
+            f"logit_mean_G",
+            f"logit_std_R",
+            f"logit_std_G",
+            f"entropy_R",
+            f"entropy_G",
+        ):
+            if key in src and not torch.is_tensor(src[key]):
+                out[f"diag_{key}"] = torch.tensor(float(src[key]), device=device)
+    return out

@@ -1,4 +1,4 @@
-"""Forward stochastic CTMC on legal assignment states."""
+"""Forward stochastic CTMC on legal assignment states (fixed total exit rate)."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -26,7 +26,6 @@ class CTMCTrajectory:
 
     def state_at(self, t: float) -> JointAssignmentState:
         """Piecewise-constant left-continuous state for time t in [0,1]."""
-        # states[k] holds on [times[k], times[k+1])
         for k in range(len(self.times) - 1):
             if self.times[k] <= t < self.times[k + 1]:
                 return self.states[k]
@@ -42,9 +41,13 @@ def simulate_forward_ctmc(
     generator: torch.Generator | None = None,
     max_events: int = 100_000,
 ) -> CTMCTrajectory:
-    """Exact Gillespie CTMC with time-dependent rates β_a(t)/|M_a|.
+    """Gillespie CTMC with fixed total exit rates β_a(t).
 
-    Q_a(A, A^m; t) = β_a(t) / |M_a(A)| for each legal move m of type a.
+    Forward proposal is uniform on legal moves of each kind:
+      r_m^a = β_a(t) / |M_a|   ⇒   Σ_m r_m^a = β_a(t)
+    (matches reverse training of π; forward prior uses π_uniform).
+
+    Time-dependent β uses integrated-hazard-aware piecewise knots at window edges.
     """
     if t_end <= t_start:
         raise ValueError("t_end must exceed t_start")
@@ -62,48 +65,71 @@ def simulate_forward_ctmc(
     n_events = 0
     while t < t_end - 1e-12 and n_events < max_events:
         moves = enumerate_legal_moves(state)
-        rates: list[tuple[LegalMove, float]] = []
+        r_on = len(moves["R"]) > 0
+        g_on = len(moves["G"]) > 0
+        beta_r = float(schedule.beta_r(t).item()) if r_on else 0.0
+        beta_g = float(schedule.beta_g(t).item()) if g_on else 0.0
         total = 0.0
-        for kind in ("R", "G"):
-            beta = float(schedule.beta(t, kind=kind).item())
-            pool = moves[kind]
-            msize = len(pool)
-            if beta <= 0.0 or msize == 0:
+        rates: list[tuple[LegalMove, float]] = []
+        for kind, beta, pool in (("R", beta_r, moves["R"]), ("G", beta_g, moves["G"])):
+            if beta <= 0.0 or not pool:
                 continue
-            r_each = beta / float(msize)
+            r_each = beta / float(len(pool))
             for m in pool:
                 rates.append((m, r_each))
                 total += r_each
+
         if total <= 1e-30:
-            # no jumps possible until some unlock; jump to next unlock or end
-            next_t = t_end
-            if schedule.is_g_locked(t) and schedule.g_lock < t_end:
-                next_t = min(next_t, schedule.g_lock + 1e-9)
-            if schedule.is_r_locked(t) and schedule.r_lock < t_end:
-                next_t = min(next_t, schedule.r_lock + 1e-9)
+            # jump to next mobility opening or end (do not freeze forever)
+            next_candidates = [t_end]
+            for lo, hi in (schedule.r_window, schedule.g_window):
+                if t < lo < t_end:
+                    next_candidates.append(lo + 1e-9)
+            next_t = min(next_candidates)
             if next_t <= t + 1e-12:
                 break
             t = min(next_t, t_end)
             times.append(t)
             states.append(state.clone())
             continue
-        # waiting time with frozen rates (piecewise approx between unlocks)
-        u = max(_rand(), 1e-12)
-        dt = -torch.log(torch.tensor(u)).item() / total
-        # clamp to next schedule knot
-        knots = [t_end]
-        if t < schedule.g_lock < t_end:
-            knots.append(schedule.g_lock)
-        if t < schedule.r_lock < t_end:
-            knots.append(schedule.r_lock)
-        t_next_knot = min(knots)
-        if t + dt >= t_next_knot:
+
+        # non-homogeneous: use integrated hazard over [t, next_knot]
+        knots = schedule.schedule_knots(t, t_end) + [t_end]
+        t_next_knot = min(k for k in knots if k > t + 1e-15)
+        # Between knots, β varies continuously; invert cumulative hazard with on-flags
+        E = -float(torch.log(torch.tensor(max(_rand(), 1e-12))).item())
+        H_seg = schedule.integrated_hazard_total(t, t_next_knot, r_on=r_on, g_on=g_on)
+        if E > H_seg + 1e-12:
+            # no event before next knot
             t = t_next_knot
             times.append(t)
             states.append(state.clone())
             continue
-        # accept a move
-        t = t + dt
+        t_ev = schedule.inverse_integrated_hazard(
+            t_next_knot, E, t_low=t, r_on=r_on, g_on=g_on
+        )
+        if t_ev is None or t_ev <= t + 1e-15:
+            t = t_next_knot
+            times.append(t)
+            states.append(state.clone())
+            continue
+        t = float(t_ev)
+        # Recompute rates at event time for kind choice (β(t) may differ)
+        beta_r = float(schedule.beta_r(t).item()) if r_on else 0.0
+        beta_g = float(schedule.beta_g(t).item()) if g_on else 0.0
+        rates = []
+        total = 0.0
+        for kind, beta, pool in (("R", beta_r, moves["R"]), ("G", beta_g, moves["G"])):
+            if beta <= 0.0 or not pool:
+                continue
+            r_each = beta / float(len(pool))
+            for m in pool:
+                rates.append((m, r_each))
+                total += r_each
+        if total <= 1e-30:
+            times.append(t)
+            states.append(state.clone())
+            continue
         pick = _rand() * total
         acc = 0.0
         chosen: LegalMove | None = None

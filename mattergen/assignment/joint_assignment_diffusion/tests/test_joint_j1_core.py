@@ -66,26 +66,45 @@ def test_g_move_requires_same_orbit_diff_copy():
         assert int(st.copy_of()[m.i]) != int(st.copy_of()[m.j])
 
 
-def test_async_schedule_lock():
-    sch = AsyncJumpSchedule(r_lock=0.72, g_lock=0.52)
+def test_async_schedule_windows_and_integral():
+    sch = AsyncJumpSchedule(r_window=(0.60, 0.95), g_window=(0.35, 0.75), kappa_r=4.0, kappa_g=6.0)
     assert float(sch.beta_r(0.5)) == 0.0
-    assert float(sch.beta_g(0.4)) == 0.0
-    assert float(sch.beta_r(0.9)) > 0.0
-    assert float(sch.beta_g(0.7)) > 0.0
+    assert float(sch.beta_g(0.2)) == 0.0
+    assert float(sch.beta_r(0.80)) > 0.0
+    assert float(sch.beta_g(0.55)) > 0.0
+    # endpoints of open interval → 0
+    assert float(sch.beta_r(0.60)) == 0.0
+    assert float(sch.beta_r(0.95)) == 0.0
+    # ∫ β ≈ κ
+    assert abs(sch.integrated_beta(0.0, 1.0, kind="R") - 4.0) < 1e-4
+    assert abs(sch.integrated_beta(0.0, 1.0, kind="G") - 6.0) < 1e-4
 
 
-def test_forward_ctmc_stays_legal_and_respects_lock():
+def test_fixed_exit_rate_softmax_sums_to_beta():
+    from mattergen.assignment.joint_assignment_diffusion.jump_heads import logits_to_rates
+    from mattergen.assignment.joint_assignment_diffusion.legal_moves import LegalMove
+
+    scored = {
+        "R": [(LegalMove("R", 0, 1), torch.tensor(0.0)), (LegalMove("R", 2, 3), torch.tensor(1.0))],
+        "G": [(LegalMove("G", 0, 2), torch.tensor(-1.0))],
+    }
+    rates = logits_to_rates(scored, beta_r=3.0, beta_g=2.0)
+    assert abs(sum(float(r) for _, r in rates["R"]) - 3.0) < 1e-5
+    assert abs(sum(float(r) for _, r in rates["G"]) - 2.0) < 1e-5
+
+
+def test_forward_ctmc_stays_legal_and_respects_window():
     st, _, _ = _toy_state()
-    sch = AsyncJumpSchedule(r_lock=0.72, g_lock=0.52, kappa_r=2.0, kappa_g=3.0)
+    sch = AsyncJumpSchedule(r_window=(0.60, 0.95), g_window=(0.35, 0.75), kappa_r=2.0, kappa_g=3.0)
     g = torch.Generator().manual_seed(0)
     traj = simulate_forward_ctmc(st, schedule=sch, generator=g)
     for s in traj.states:
         assert s.validate()["legal"]
     for e in traj.events:
         if e.kind == "R":
-            assert e.time > sch.r_lock - 1e-9
+            assert sch.is_r_active(e.time)
         if e.kind == "G":
-            assert e.time > sch.g_lock - 1e-9
+            assert sch.is_g_active(e.time)
 
 
 def test_uniform_prior_legal():

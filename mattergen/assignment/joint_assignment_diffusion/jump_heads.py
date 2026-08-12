@@ -1,5 +1,8 @@
-"""Direct legal jump logits for R and G moves (no energy model)."""
+"""Direct legal jump logits for R and G moves (fixed total exit rate)."""
 from __future__ import annotations
+
+import math
+from typing import Any
 
 import torch
 from torch import nn
@@ -22,7 +25,7 @@ class RJumpHead(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, 1),
         )
-        # zero-init logits → exp(0)=1 → uniform CTMC proposal at start
+        # zero-init logits → uniform π at start
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
@@ -63,7 +66,6 @@ class RJumpHead(nn.Module):
         orbit_of: torch.Tensor,
         rho_vecs: torch.Tensor,
     ) -> torch.Tensor:
-        """Batched pair logits for moves (ii[m], jj[m]); same features as pair_logit."""
         hi, hj = h[ii], h[jj]
         oi, oj = orbit_of[ii].long(), orbit_of[jj].long()
         feat = torch.cat(
@@ -86,7 +88,7 @@ class GJumpHead(nn.Module):
 
     def __init__(self, hidden: int):
         super().__init__()
-        in_dim = 2 * hidden + 2 * hidden + 2 * hidden  # sum/diff + two exclusion contexts + two zo
+        in_dim = 2 * hidden + 2 * hidden + 2 * hidden
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.SiLU(),
@@ -108,7 +110,6 @@ class GJumpHead(nn.Module):
         copy_of: torch.Tensor,
         v_copies: torch.Tensor,
     ) -> torch.Tensor:
-        # exclusion: mean of other atoms in same copy, fallback to v_k if singleton
         def excl(idx: int) -> torch.Tensor:
             k = int(copy_of[idx])
             mask = (copy_of == k) & (torch.arange(h.shape[0], device=h.device) != idx)
@@ -132,7 +133,6 @@ class GJumpHead(nn.Module):
         orbit_of: torch.Tensor,
         excl: torch.Tensor,
     ) -> torch.Tensor:
-        """Batched pair logits; excl[n, H] is precomputed exclusion context per atom."""
         hi, hj = h[ii], h[jj]
         ei, ej = excl[ii], excl[jj]
         oi, oj = orbit_of[ii].long(), orbit_of[jj].long()
@@ -155,7 +155,6 @@ def _exclusion_contexts(
     copy_of: torch.Tensor,
     v_copies: torch.Tensor,
 ) -> torch.Tensor:
-    """excl[i] = mean of other atoms in same copy; v_k if singleton. Matches GJumpHead.pair_logit."""
     n, hid = h.shape
     device = h.device
     dtype = h.dtype
@@ -167,7 +166,6 @@ def _exclusion_contexts(
         copy_sum.index_add_(0, k_all, h)
         copy_cnt.index_add_(0, k_all, torch.ones(n, device=device, dtype=dtype))
     cnt_i = copy_cnt[k_all]
-    # (sum - h_i) / (cnt - 1) when cnt > 1
     denom = (cnt_i - 1.0).clamp_min(1.0).unsqueeze(-1)
     excl = (copy_sum[k_all] - h) / denom
     singleton = cnt_i <= 1
@@ -188,7 +186,7 @@ def compute_move_logits(
     r_head: RJumpHead,
     g_head: GJumpHead,
 ) -> dict[str, list[tuple[LegalMove, torch.Tensor]]]:
-    """Score all legal moves; batched MLP forwards (same features as per-pair path)."""
+    """Score all legal moves; batched MLP forwards."""
     orbit_of = state.orbit_of()
     copy_of = state.copy_of()
     out: dict[str, list[tuple[LegalMove, torch.Tensor]]] = {"R": [], "G": []}
@@ -204,7 +202,6 @@ def compute_move_logits(
         logits = r_head.batch_logits(
             h, ii, jj, z_orbit=z_orbit, c_i=c_i, orbit_of=orbit_of, rho_vecs=rel
         )
-        # Keep per-move tensors for autograd graph connectivity (same as loop).
         for m, logit in zip(r_moves, logits):
             out["R"].append((m, logit))
 
@@ -221,6 +218,23 @@ def compute_move_logits(
     return out
 
 
+def logits_to_pi(
+    scored: dict[str, list[tuple[LegalMove, torch.Tensor]]],
+    *,
+    clip: float = 8.0,
+) -> dict[str, list[tuple[LegalMove, torch.Tensor]]]:
+    """π_m = softmax_m ℓ_m over legal moves of each kind (empty → [])."""
+    pi: dict[str, list[tuple[LegalMove, torch.Tensor]]] = {"R": [], "G": []}
+    for kind in ("R", "G"):
+        pool = scored.get(kind, [])
+        if not pool:
+            continue
+        logits = torch.stack([logit for _, logit in pool]).clamp(-clip, clip)
+        probs = torch.softmax(logits, dim=0)
+        pi[kind] = [(m, probs[i]) for i, (m, _) in enumerate(pool)]
+    return pi
+
+
 def logits_to_rates(
     scored: dict[str, list[tuple[LegalMove, torch.Tensor]]],
     *,
@@ -228,17 +242,53 @@ def logits_to_rates(
     beta_g: float,
     clip: float = 8.0,
 ) -> dict[str, list[tuple[LegalMove, torch.Tensor]]]:
-    """r = β/|M| * exp(clip(ℓ)). Vectorized exp over the move pool."""
+    """Fixed total exit rate: r_m^a = β_a(t) · π_m^a,  Σ_m r_m^a = β_a(t).
+
+    Illegal moves are absent from the pool (rate 0). Empty pool → no rates.
+    """
+    pi = logits_to_pi(scored, clip=clip)
     rates: dict[str, list[tuple[LegalMove, torch.Tensor]]] = {"R": [], "G": []}
     for kind, beta in (("R", beta_r), ("G", beta_g)):
-        pool = scored[kind]
+        pool = pi[kind]
         if not pool:
             continue
-        msize = max(len(pool), 1)
-        logits = torch.stack([logit for _, logit in pool])
         if beta <= 0:
-            rates_t = logits * 0.0
+            rates[kind] = [(m, p * 0.0) for m, p in pool]
         else:
-            rates_t = (beta / float(msize)) * torch.exp(logits.clamp(-clip, clip))
-        rates[kind] = [(m, rates_t[i]) for i, (m, _) in enumerate(pool)]
+            rates[kind] = [(m, float(beta) * p) for m, p in pool]
     return rates
+
+
+def jump_pool_diagnostics(
+    scored: dict[str, list[tuple[LegalMove, torch.Tensor]]],
+    *,
+    beta_r: float,
+    beta_g: float,
+    clip: float = 8.0,
+) -> dict[str, Any]:
+    """R/G legal counts, logit moments, entropy, uniform NLL, total rate."""
+    out: dict[str, Any] = {}
+    pi = logits_to_pi(scored, clip=clip)
+    for kind, beta in (("R", beta_r), ("G", beta_g)):
+        pool = scored.get(kind, [])
+        n = len(pool)
+        out[f"num_{kind}_moves"] = n
+        out[f"beta_{kind}"] = float(beta)
+        if n == 0:
+            out[f"logit_mean_{kind}"] = 0.0
+            out[f"logit_std_{kind}"] = 0.0
+            out[f"entropy_{kind}"] = 0.0
+            out[f"uniform_nll_{kind}"] = 0.0
+            out[f"total_rate_{kind}"] = 0.0
+            continue
+        logits = torch.stack([logit.detach() for _, logit in pool]).clamp(-clip, clip)
+        out[f"logit_mean_{kind}"] = float(logits.mean())
+        out[f"logit_std_{kind}"] = float(logits.std(unbiased=False)) if n > 1 else 0.0
+        probs = torch.softmax(logits, dim=0)
+        ent = float(-(probs * probs.clamp_min(1e-12).log()).sum())
+        out[f"entropy_{kind}"] = ent
+        out[f"uniform_nll_{kind}"] = float(math.log(n))
+        # Σ r = β when n>0
+        out[f"total_rate_{kind}"] = float(beta) if beta > 0 else 0.0
+        out[f"pi_max_{kind}"] = float(probs.max())
+    return out

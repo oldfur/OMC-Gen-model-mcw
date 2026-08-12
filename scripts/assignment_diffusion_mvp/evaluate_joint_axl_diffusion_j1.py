@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate J1: legality, lock schedule, metrics vs clean target."""
+"""Evaluate J1.1: legality, mobility windows, jump budgets, metrics vs clean target."""
 from __future__ import annotations
 
 import argparse
@@ -19,13 +19,13 @@ from mattergen.assignment.joint_assignment_diffusion.ctmc import simulate_forwar
 from mattergen.assignment.joint_assignment_diffusion.joint_model import JointAXLModel
 from mattergen.assignment.joint_assignment_diffusion.metrics import (
     assignment_vs_target,
+    jump_budget_diagnostics,
     lock_schedule_checks,
     trajectory_legality,
 )
 from mattergen.assignment.joint_assignment_diffusion.schedule import AsyncJumpSchedule
 from mattergen.assignment.joint_assignment_diffusion.state import a_from_role_and_copy
 from mattergen.assignment.noisy_copy_assignment.gemnet_loader import load_molecular_csp_gemnet
-# evaluate path currently uses CTMC-only metrics; geometry ChemGraph not required here
 
 
 def main() -> None:
@@ -60,13 +60,7 @@ def main() -> None:
         freeze=False,
         strict=True,
     )
-    sch_cfg = cfg.get("schedule") or {}
-    schedule = AsyncJumpSchedule(
-        r_lock=float(sch_cfg.get("r_lock", 0.72)),
-        g_lock=float(sch_cfg.get("g_lock", 0.52)),
-        kappa_r=float(sch_cfg.get("kappa_r", 4.0)),
-        kappa_g=float(sch_cfg.get("kappa_g", 6.0)),
-    )
+    schedule = AsyncJumpSchedule.from_config(cfg.get("schedule") or {})
     model = JointAXLModel(bundle.denoiser.to(device), num_orbits=partition.J, schedule=schedule).to(device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["joint_state_dict"], strict=False)
@@ -83,13 +77,15 @@ def main() -> None:
     )
 
     rows = []
+    seed_summaries = []
     for seed in (cfg.get("evaluation") or {}).get("seeds", [0, 1, 2, 3]):
         g = torch.Generator(device="cpu")
         g.manual_seed(int(seed))
         traj = simulate_forward_ctmc(target, schedule=schedule, generator=g)
         leg = trajectory_legality(traj)
         locks = lock_schedule_checks(traj, schedule)
-        # metrics at selected times
+        budget = jump_budget_diagnostics(traj, schedule)
+        seed_summaries.append({"seed": int(seed), **leg, **locks, **budget})
         for tf in [0.0, 0.3, 0.5, 0.6, 0.8, 1.0]:
             st = traj.state_at(tf)
             m = assignment_vs_target(st, target)
@@ -99,10 +95,11 @@ def main() -> None:
                     "t": tf,
                     **leg,
                     **locks,
+                    **budget,
                     **m,
                 }
             )
-        print(json.dumps({"event": "j1_eval_seed", "seed": seed, **leg, **locks}), flush=True)
+        print(json.dumps({"event": "j1_eval_seed", "seed": seed, **leg, **locks, **budget}), flush=True)
 
     with (out / "eval_trace.jsonl").open("w") as f:
         for r in rows:
@@ -111,7 +108,15 @@ def main() -> None:
         "all_legal": all(r["all_legal"] for r in rows),
         "r_lock_ok": all(r["r_lock_ok"] for r in rows),
         "g_lock_ok": all(r["g_lock_ok"] for r in rows),
-        "mean_exact_C_at_0": sum(1 for r in rows if r["t"] == 0.0 and r.get("exact_C")) / max(1, sum(1 for r in rows if r["t"] == 0.0)),
+        "mean_exact_C_at_0": sum(1 for r in rows if r["t"] == 0.0 and r.get("exact_C"))
+        / max(1, sum(1 for r in rows if r["t"] == 0.0)),
+        "mean_n_R": sum(s["n_R"] for s in seed_summaries) / max(1, len(seed_summaries)),
+        "mean_n_G": sum(s["n_G"] for s in seed_summaries) / max(1, len(seed_summaries)),
+        "expected_R": schedule.kappa_r,
+        "expected_G": schedule.kappa_g,
+        "r_window": list(schedule.r_window),
+        "g_window": list(schedule.g_window),
+        "seeds_differ": len({(s["n_R"], s["n_G"], s["num_events"]) for s in seed_summaries}) > 1,
     }
     (out / "eval_summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps({"event": "j1_eval_done", **summary}), flush=True)

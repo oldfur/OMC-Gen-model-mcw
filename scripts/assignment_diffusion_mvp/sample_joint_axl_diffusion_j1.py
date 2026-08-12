@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sample joint A+X+L with A-first Lie reverse sampler (RHODIN01 MVP)."""
+"""Sample joint A+X+L with A-first Lie reverse sampler (J1.1: ctmc_A + static_A)."""
 from __future__ import annotations
 
 import argparse
@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 from mattergen.assignment.global_copy_assembly.orbit_membership import build_orbit_partition
 from mattergen.assignment.joint_assignment_diffusion.joint_model import JointAXLModel
 from mattergen.assignment.joint_assignment_diffusion.metrics import (
+    jump_budget_diagnostics,
     lock_schedule_checks,
     trajectory_legality,
 )
@@ -64,7 +65,13 @@ def main() -> None:
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, default=None)
-    p.add_argument("--num-samples", type=int, default=4)
+    p.add_argument("--num-samples", type=int, default=None)
+    p.add_argument(
+        "--assignment-mode",
+        type=str,
+        default=None,
+        help="ctmc_A | static_A | all (from config evaluation.assignment_modes)",
+    )
     p.add_argument("--execute", action="store_true")
     p.add_argument("--mattergen-model-path", type=str, default=None)
     p.add_argument("--mattergen-load-epoch", type=int, default=None)
@@ -92,66 +99,108 @@ def main() -> None:
         freeze=False,
         strict=True,
     )
-    sch_cfg = cfg.get("schedule") or {}
-    schedule = AsyncJumpSchedule(
-        r_lock=float(sch_cfg.get("r_lock", 0.72)),
-        g_lock=float(sch_cfg.get("g_lock", 0.52)),
-        kappa_r=float(sch_cfg.get("kappa_r", 4.0)),
-        kappa_g=float(sch_cfg.get("kappa_g", 6.0)),
-    )
+    schedule = AsyncJumpSchedule.from_config(cfg.get("schedule") or {})
     model = JointAXLModel(bundle.denoiser.to(device), num_orbits=partition.J, schedule=schedule).to(device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["joint_state_dict"], strict=False)
     model.eval()
     model.set_orbit_relations(partition, sample["role_edge_index"], sample["role_bond_type"])
 
-    timesteps = (cfg.get("evaluation") or {}).get("timesteps") or [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
+    eval_cfg = cfg.get("evaluation") or {}
+    timesteps = eval_cfg.get("timesteps") or [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
+    modes = eval_cfg.get("assignment_modes") or ["ctmc_A"]
+    if args.assignment_mode and args.assignment_mode != "all":
+        modes = [args.assignment_mode]
+    n_per = int(args.num_samples or eval_cfg.get("num_samples_per_mode", 4))
+
     results = []
-    for si in range(args.num_samples):
-        g = torch.Generator(device="cpu")
-        g.manual_seed(1000 + si)
-        traj = sample_joint_prior_and_trajectory(
-            model=model,
-            partition=partition,
-            atomic_numbers=sample["z"],
-            role_z=sample["role_z"],
-            K=int(sample["Z"]),
-            sample_tensors=sample,
-            chemgraph_builder=build_cg,
-            timesteps=timesteps,
-            generator=g,
-        )
-        # wrap for metrics
-        ctmc = CTMCTrajectory(
-            times=traj.times,
-            states=traj.assignments,
-            events=traj.events,
-        )
-        leg = trajectory_legality(ctmc)
-        locks = lock_schedule_checks(ctmc, schedule)
-        final = traj.assignments[-1]
-        row = {
-            "sample_index": si,
-            "final_legal": final.validate()["legal"],
-            "num_events": len(traj.events),
-            **leg,
-            **locks,
-        }
-        results.append(row)
-        torch.save(
-            {
-                "frac": traj.frac_list[-1].cpu(),
-                "cell": traj.cell_list[-1].cpu(),
-                "A": final.A.cpu(),
-                "orbit": final.orbit_of().cpu(),
-                "copy": final.copy_of().cpu(),
-            },
-            out / f"sample_{si}.pt",
-        )
-        print(json.dumps({"event": "j1_sample", **row}), flush=True)
+    for mode in modes:
+        for si in range(n_per):
+            g = torch.Generator(device="cpu")
+            g.manual_seed(1000 + si + (0 if mode == "ctmc_A" else 10_000))
+            traj = sample_joint_prior_and_trajectory(
+                model=model,
+                partition=partition,
+                atomic_numbers=sample["z"],
+                role_z=sample["role_z"],
+                K=int(sample["Z"]),
+                sample_tensors=sample,
+                chemgraph_builder=build_cg,
+                timesteps=timesteps,
+                generator=g,
+                assignment_mode=mode,
+            )
+            ctmc = CTMCTrajectory(
+                times=traj.times,
+                states=traj.assignments,
+                events=traj.events,
+            )
+            leg = trajectory_legality(ctmc)
+            locks = lock_schedule_checks(ctmc, schedule)
+            budget = jump_budget_diagnostics(ctmc, schedule)
+            final = traj.assignments[-1]
+            row = {
+                "assignment_mode": mode,
+                "sample_index": si,
+                "final_legal": final.validate()["legal"],
+                "num_events": len(traj.events),
+                "n_R": budget["n_R"],
+                "n_G": budget["n_G"],
+                "expected_R": budget["expected_R"],
+                "expected_G": budget["expected_G"],
+                "H_R": budget["H_R"],
+                "H_G": budget["H_G"],
+                "ratio_R": budget["ratio_R"],
+                "ratio_G": budget["ratio_G"],
+                "jumps_per_bin": traj.diagnostics.get("jumps_per_bin", {}),
+                **leg,
+                **locks,
+            }
+            results.append(row)
+            tag = f"{mode}_{si}"
+            torch.save(
+                {
+                    "assignment_mode": mode,
+                    "frac": traj.frac_list[-1].cpu(),
+                    "cell": traj.cell_list[-1].cpu(),
+                    "A": final.A.cpu(),
+                    "orbit": final.orbit_of().cpu(),
+                    "copy": final.copy_of().cpu(),
+                    "diagnostics": traj.diagnostics,
+                },
+                out / f"sample_{tag}.pt",
+            )
+            # also write legacy names for ctmc_A
+            if mode == "ctmc_A":
+                torch.save(
+                    {
+                        "assignment_mode": mode,
+                        "frac": traj.frac_list[-1].cpu(),
+                        "cell": traj.cell_list[-1].cpu(),
+                        "A": final.A.cpu(),
+                        "orbit": final.orbit_of().cpu(),
+                        "copy": final.copy_of().cpu(),
+                        "diagnostics": traj.diagnostics,
+                    },
+                    out / f"sample_{si}.pt",
+                )
+            print(json.dumps({"event": "j1_sample", **{k: v for k, v in row.items() if k != "jumps_per_bin"}}), flush=True)
 
     (out / "sample_summary.json").write_text(json.dumps(results, indent=2))
-    print(json.dumps({"event": "j1_sample_done", "n": len(results), "output": str(out)}), flush=True)
+    # compact success criteria for CTMC repair
+    ctmc_rows = [r for r in results if r["assignment_mode"] == "ctmc_A"]
+    gate = {
+        "ctmc_mean_n_R": sum(r["n_R"] for r in ctmc_rows) / max(1, len(ctmc_rows)),
+        "ctmc_mean_n_G": sum(r["n_G"] for r in ctmc_rows) / max(1, len(ctmc_rows)),
+        "expected_R": schedule.kappa_r,
+        "expected_G": schedule.kappa_g,
+        "static_all_zero_jumps": all(
+            r["num_events"] == 0 for r in results if r["assignment_mode"] == "static_A"
+        ),
+        "ctmc_not_systematically_zero": any(r["num_events"] > 0 for r in ctmc_rows),
+    }
+    (out / "sample_gate.json").write_text(json.dumps(gate, indent=2))
+    print(json.dumps({"event": "j1_sample_done", "n": len(results), "output": str(out), **gate}), flush=True)
 
 
 if __name__ == "__main__":

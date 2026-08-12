@@ -43,14 +43,14 @@ python scripts/assignment_diffusion_mvp/evaluate_joint_axl_diffusion_j1.py \
   --mattergen-checkpoint "$MATTERGEN_CKPT" \
   --execute
 
-echo "[4/4] sample"
+echo "[4/4] sample (ctmc_A + static_A)"
 python scripts/assignment_diffusion_mvp/sample_joint_axl_diffusion_j1.py \
   --config "$CFG" \
   --checkpoint "$OUT/final_checkpoint.pt" \
   --mattergen-model-path "$MATTERGEN_RUN" \
   --mattergen-load-epoch "$MATTERGEN_LOAD_EPOCH" \
   --mattergen-checkpoint "$MATTERGEN_CKPT" \
-  --num-samples 4 \
+  --assignment-mode all \
   --execute
 
-echo "DONE J1 → $OUT"
+echo "DONE J1.1 → $OUT"

@@ -18,7 +18,14 @@ from .conditioning import (
     OrbitSiteEncoder,
     SpatialEdgeAssignmentFeaturizer,
 )
-from .jump_heads import GJumpHead, RJumpHead, compute_move_logits, logits_to_rates
+from .jump_heads import (
+    GJumpHead,
+    RJumpHead,
+    compute_move_logits,
+    jump_pool_diagnostics,
+    logits_to_pi,
+    logits_to_rates,
+)
 from .legal_moves import enumerate_legal_moves
 from .schedule import AsyncJumpSchedule
 from .state import JointAssignmentState
@@ -30,6 +37,7 @@ class JointModelOutput:
     node_hidden: torch.Tensor
     move_logits: dict
     move_rates: dict
+    move_pi: dict
     diagnostics: dict
 
 
@@ -245,7 +253,9 @@ class JointAXLModel(nn.Module):
         copy_of = meta["copy_of"]
         move_logits: dict = {}
         move_rates: dict = {}
+        move_pi: dict = {}
         v_a = None
+        jump_diag: dict = {}
         if compute_jumps:
             v, c_i, v_a = self.copy_pool(h, orbit_of, copy_of, z_orbit, state.K)
             moves = enumerate_legal_moves(state)
@@ -261,20 +271,27 @@ class JointAXLModel(nn.Module):
                 g_head=self.g_head,
             )
             move_logits = scored
+            # J1.1: r_m = β(t) · softmax(ℓ)_m  (fixed total exit rate)
+            move_pi = logits_to_pi(scored)
             move_rates = logits_to_rates(
                 scored,
                 beta_r=meta["beta_r"],
                 beta_g=meta["beta_g"],
+            )
+            jump_diag = jump_pool_diagnostics(
+                scored, beta_r=meta["beta_r"], beta_g=meta["beta_g"]
             )
         return JointModelOutput(
             chemgraph_scores=scores,
             node_hidden=h,
             move_logits=move_logits,
             move_rates=move_rates,
+            move_pi=move_pi,
             diagnostics={
                 **meta,
                 "v_A": v_a,
                 "num_r_moves": len(move_logits.get("R", [])),
                 "num_g_moves": len(move_logits.get("G", [])),
+                **jump_diag,
             },
         )

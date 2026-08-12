@@ -1,4 +1,4 @@
-"""J1 validation metrics: legality, lock schedules, copy metrics."""
+"""J1 validation metrics: legality, mobility windows, copy metrics."""
 from __future__ import annotations
 
 from typing import Any
@@ -18,24 +18,53 @@ def trajectory_legality(traj: CTMCTrajectory) -> dict[str, Any]:
     for st in traj.states:
         if not st.validate()["legal"]:
             illegal += 1
+    n_R = sum(1 for e in traj.events if e.kind == "R")
+    n_G = sum(1 for e in traj.events if e.kind == "G")
     return {
         "num_states": len(traj.states),
         "illegal_state_count": illegal,
         "all_legal": illegal == 0,
         "num_events": len(traj.events),
+        "n_R": n_R,
+        "n_G": n_G,
     }
 
 
 def lock_schedule_checks(traj: CTMCTrajectory, schedule: AsyncJumpSchedule) -> dict[str, Any]:
-    r_after_lock = sum(1 for e in traj.events if e.kind == "R" and e.time <= schedule.r_lock + 1e-9)
-    g_after_lock = sum(1 for e in traj.events if e.kind == "G" and e.time <= schedule.g_lock + 1e-9)
+    """Jumps must lie strictly inside active mobility windows."""
+    r_outside = sum(1 for e in traj.events if e.kind == "R" and not schedule.is_r_active(e.time))
+    g_outside = sum(1 for e in traj.events if e.kind == "G" and not schedule.is_g_active(e.time))
     return {
-        "r_jumps_at_or_below_lock": r_after_lock,
-        "g_jumps_at_or_below_lock": g_after_lock,
-        "r_lock_ok": r_after_lock == 0,
-        "g_lock_ok": g_after_lock == 0,
+        "r_jumps_outside_window": r_outside,
+        "g_jumps_outside_window": g_outside,
+        # legacy keys (eval scripts / terminal compatibility)
+        "r_jumps_at_or_below_lock": r_outside,
+        "g_jumps_at_or_below_lock": g_outside,
+        "r_lock_ok": r_outside == 0,
+        "g_lock_ok": g_outside == 0,
         "r_lock": schedule.r_lock,
         "g_lock": schedule.g_lock,
+        "r_window": list(schedule.r_window),
+        "g_window": list(schedule.g_window),
+    }
+
+
+def jump_budget_diagnostics(
+    traj: CTMCTrajectory,
+    schedule: AsyncJumpSchedule,
+) -> dict[str, Any]:
+    n_R = sum(1 for e in traj.events if e.kind == "R")
+    n_G = sum(1 for e in traj.events if e.kind == "G")
+    exp = schedule.expected_jump_budget()
+    return {
+        "n_R": n_R,
+        "n_G": n_G,
+        "expected_R": exp["R"],
+        "expected_G": exp["G"],
+        "H_R": schedule.integrated_beta(0.0, 1.0, kind="R"),
+        "H_G": schedule.integrated_beta(0.0, 1.0, kind="G"),
+        "ratio_R": n_R / max(exp["R"], 1e-8),
+        "ratio_G": n_G / max(exp["G"], 1e-8),
     }
 
 

@@ -144,12 +144,7 @@ def main() -> None:
         p.requires_grad_(True)
 
     sch_cfg = cfg.get("schedule") or {}
-    schedule = AsyncJumpSchedule(
-        r_lock=float(sch_cfg.get("r_lock", 0.72)),
-        g_lock=float(sch_cfg.get("g_lock", 0.52)),
-        kappa_r=float(sch_cfg.get("kappa_r", 4.0)),
-        kappa_g=float(sch_cfg.get("kappa_g", 6.0)),
-    )
+    schedule = AsyncJumpSchedule.from_config(sch_cfg)
     model = JointAXLModel(denoiser, num_orbits=partition.J, schedule=schedule).to(device)
     sample_d = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in sample.items()}
     model.set_orbit_relations(partition, sample_d["role_edge_index"], sample_d["role_bond_type"])
@@ -172,9 +167,16 @@ def main() -> None:
     g.manual_seed(int(cfg.get("seed", 17)))
 
     prov = {
-        "J1_MODE": "joint_axl_ctmc",
+        "J1_MODE": "joint_axl_ctmc_j1_1",
+        "RATE_MODEL": "fixed_exit_beta_softmax",
+        "ASSIGNMENT_LOSS": "reverse_categorical_nll",
+        "R_WINDOW": list(schedule.r_window),
+        "G_WINDOW": list(schedule.g_window),
+        "KAPPA_R": schedule.kappa_r,
+        "KAPPA_G": schedule.kappa_g,
         "R_LOCK": schedule.r_lock,
         "G_LOCK": schedule.g_lock,
+        "EXPECTED_JUMPS": schedule.expected_jump_budget(),
         "MATTERGEN_LOAD_EPOCH": bundle.load_epoch,
         "MATTERGEN_CHECKPOINT_SHA": bundle.checkpoint_sha256,
         "NOISE_SOURCE": PROVENANCE["noise_source"],
@@ -207,25 +209,34 @@ def main() -> None:
                 copy=sample_d["copy"],
                 aug=aug,
             )
-            # forward CTMC on A
+            # forward CTMC on A (uniform π prior, fixed exit β)
             traj = simulate_forward_ctmc(st0, schedule=schedule, t_start=0.0, t_end=1.0, generator=g)
-            # sample geometry time t and segment [s,t]
-            t = noise.sample_t(1, device=device)
-            t_t = float(t.reshape(-1)[0].item())
-            # s ~ Uniform(0,t) for reverse segment
+            # Geometry time t_X ~ U(0,1); assignment times from active mobility
+            t_x = noise.sample_t(1, device=device)
+            t_x_f = float(t_x.reshape(-1)[0].item())
+            t_r_f = schedule.sample_t_proportional_to_beta(kind="R", generator=g)
+            t_g_f = schedule.sample_t_proportional_to_beta(kind="G", generator=g)
+            t_r = torch.tensor([t_r_f], device=device, dtype=torch.float32)
+            t_g = torch.tensor([t_g_f], device=device, dtype=torch.float32)
+            # A-first Lie geometry: A at s < t_X
             u = float(torch.rand((), generator=g).item())
-            t_s = u * t_t
-            state_t = traj.state_at(t_t)
+            t_s = u * t_x_f
             state_s = traj.state_at(t_s)
-            # geometry noise
-            noisy = noise.corrupt_fixed_sample(
-                frac_coords_0=geo["pos"],
-                lattice_0=sample_d["cell"],
-                num_atoms=int(sample_d["N"]),
-                t=t,
-                generator=g,
-            )
-            # sample dict for chemgraph uses augmented atoms + mol_* for molecule_conditioner
+            state_x = traj.state_at(t_x_f)
+
+            def _corrupt(t_tensor):
+                return noise.corrupt_fixed_sample(
+                    frac_coords_0=geo["pos"],
+                    lattice_0=sample_d["cell"],
+                    num_atoms=int(sample_d["N"]),
+                    t=t_tensor,
+                    generator=g,
+                )
+
+            noisy_x = _corrupt(t_x)
+            noisy_r = _corrupt(t_r)
+            noisy_g = _corrupt(t_g)
+
             samp_aug = dict(sample_d)
             samp_aug["z"] = geo["z"]
             samp_aug["pos"] = geo["pos"]
@@ -233,7 +244,6 @@ def main() -> None:
                 samp_aug["role"] = geo["role"]
             if "copy" in geo:
                 samp_aug["copy"] = geo["copy"]
-            # Reconstruct mol graph on augmented role/copy (atom order already permuted)
             mol_extra = build_mol_conditioning_from_sample(
                 {
                     "z": samp_aug["z"],
@@ -244,7 +254,9 @@ def main() -> None:
                 }
             )
             clean_cg = build_cg(samp_aug, geo["pos"], sample_d["cell"], extra_mol=mol_extra)
-            noisy_cg = build_cg(samp_aug, noisy.frac_coords_t, noisy.lattice_t, extra_mol=mol_extra)
+            noisy_cg_x = build_cg(samp_aug, noisy_x.frac_coords_t, noisy_x.lattice_t, extra_mol=mol_extra)
+            noisy_cg_r = build_cg(samp_aug, noisy_r.frac_coords_t, noisy_r.lattice_t, extra_mol=mol_extra)
+            noisy_cg_g = build_cg(samp_aug, noisy_g.frac_coords_t, noisy_g.lattice_t, extra_mol=mol_extra)
 
             opt.zero_grad(set_to_none=True)
             losses = joint_training_step_losses(
@@ -252,30 +264,58 @@ def main() -> None:
                 loss_fn=loss_fn,
                 corruption=noise.corruption,
                 clean_cg=clean_cg,
-                noisy_cg=noisy_cg,
-                t=noisy.t,
-                state_for_geometry=state_s,  # A_s for geometry (A-first Lie)
+                noisy_cg_geom=noisy_cg_x,
+                t_geom=noisy_x.t,
+                state_for_geometry=state_s,
                 traj=traj,
-                t_s=t_s,
-                t_t=t_t,
+                noisy_cg_r=noisy_cg_r,
+                t_r=t_r,
+                noisy_cg_g=noisy_cg_g,
+                t_g=t_g,
                 lambda_r=float(loss_w.get("lambda_r", 1.0)),
                 lambda_g=float(loss_w.get("lambda_g", 1.0)),
             )
             losses["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
             opt.step()
+            n_R = sum(1 for e in traj.events if e.kind == "R")
+            n_G = sum(1 for e in traj.events if e.kind == "G")
             row = {
                 "step": step,
-                "t": t_t,
+                "t_X": t_x_f,
+                "t_R": t_r_f,
+                "t_G": t_g_f,
                 "t_s": t_s,
                 "geometry_loss": float(losses["L_geom"].detach()),
                 "L_R": float(losses["L_R"].detach()),
                 "L_G": float(losses["L_G"].detach()),
+                "L_R_uniform": float(losses["L_R_uniform"].detach()),
+                "L_G_uniform": float(losses["L_G_uniform"].detach()),
+                "delta_L_R": float(losses["delta_L_R"].detach()),
+                "delta_L_G": float(losses["delta_L_G"].detach()),
                 "total_loss": float(losses["loss"].detach()),
                 "num_fwd_events": len(traj.events),
-                "state_t_legal": state_t.validate()["legal"],
+                "n_R_fwd": n_R,
+                "n_G_fwd": n_G,
+                "n_R_events_loss": float(losses["n_R_events"].detach()),
+                "n_G_events_loss": float(losses["n_G_events"].detach()),
+                "H_R": schedule.integrated_beta(0.0, 1.0, kind="R"),
+                "H_G": schedule.integrated_beta(0.0, 1.0, kind="G"),
+                "expected_R": schedule.kappa_r,
+                "expected_G": schedule.kappa_g,
                 "state_s_legal": state_s.validate()["legal"],
+                "state_x_legal": state_x.validate()["legal"],
             }
+            for k in (
+                "diag_num_R_moves",
+                "diag_num_G_moves",
+                "diag_logit_mean_R",
+                "diag_logit_mean_G",
+                "diag_entropy_R",
+                "diag_entropy_G",
+            ):
+                if k in losses:
+                    row[k] = float(losses[k].detach())
             stream.write(json.dumps(row) + "\n")
             if step % log_every == 0 or step + 1 == steps:
                 print(json.dumps(row), flush=True)
