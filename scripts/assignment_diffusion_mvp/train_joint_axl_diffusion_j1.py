@@ -26,7 +26,10 @@ from mattergen.assignment.joint_assignment_diffusion.symmetry import (
     apply_symmetry_to_state,
     sample_symmetry_augment,
 )
-from mattergen.assignment.noisy_copy_assignment.gemnet_loader import load_molecular_csp_gemnet
+from mattergen.assignment.noisy_copy_assignment.gemnet_loader import (
+    build_mol_conditioning_from_sample,
+    load_molecular_csp_gemnet,
+)
 from mattergen.assignment.noisy_copy_assignment.mattergen_noise_adapter import (
     MatterGenNativeNoiseAdapter,
     PROVENANCE,
@@ -40,22 +43,64 @@ def resolve_device(req: str) -> torch.device:
     return torch.device(req)
 
 
+def permute_mol_conditioning(extra: dict, atom_perm: torch.Tensor) -> dict:
+    """Remap mol_* tensors after atom permutation (inverse map for edge indices)."""
+    device = atom_perm.device
+    n = int(atom_perm.numel())
+    inv = torch.empty(n, dtype=torch.long, device=device)
+    inv[atom_perm] = torch.arange(n, device=device)
+    out = {}
+    for k, v in extra.items():
+        if k == "mol_copy_id":
+            continue
+        if not torch.is_tensor(v):
+            out[k] = v
+            continue
+        v = v.to(device=device)
+        if k == "mol_x" or k == "mol_atom_id" or (v.ndim >= 1 and v.shape[0] == n and k != "mol_bond_edge_index"):
+            out[k] = v[atom_perm]
+        elif k == "mol_bond_edge_index" and v.numel() > 0:
+            out[k] = inv[v.long()]
+        else:
+            out[k] = v
+    return out
+
+
 def build_cg(sample: dict, frac, cell, extra_mol: dict | None = None):
+    """Build ChemGraphBatch with molecular-CSP mol_* fields required by GemNet conditioner."""
     n = int(sample["N"])
     lat = cell if cell.ndim == 3 else cell.unsqueeze(0)
+    device = frac.device
     kw = dict(
-        atomic_numbers=sample["z"].long(),
+        atomic_numbers=sample["z"].long().to(device),
         pos=frac,
-        cell=lat,
-        num_atoms=torch.tensor([n], dtype=torch.long, device=frac.device),
+        cell=lat.to(device),
+        num_atoms=torch.tensor([n], dtype=torch.long, device=device),
         num_nodes=n,
     )
-    if extra_mol:
-        for k, v in extra_mol.items():
-            if k == "mol_copy_id":
-                continue
-            if torch.is_tensor(v):
-                kw[k] = v.to(frac.device)
+    if extra_mol is None:
+        # Build from role/copy graph if sample lacks native mol_*
+        base = {
+            "z": sample["z"],
+            "role": sample.get("role"),
+            "copy": sample.get("copy"),
+            "role_edge_index": sample.get("role_edge_index"),
+            "role_bond_type": sample.get("role_bond_type"),
+        }
+        for k in ("mol_x", "mol_bond_edge_index", "mol_bond_attr", "mol_atom_id"):
+            if k in sample:
+                base[k] = sample[k]
+        extra_mol = build_mol_conditioning_from_sample(base)
+    for k, v in extra_mol.items():
+        if k == "mol_copy_id":
+            continue
+        if torch.is_tensor(v):
+            kw[k] = v.to(device)
+        else:
+            kw[k] = v
+    missing = [k for k in ("mol_x", "mol_bond_edge_index", "mol_bond_attr") if k not in kw]
+    if missing:
+        raise KeyError(f"ChemGraph missing mol conditioning fields: {missing}")
     return Batch.from_data_list([ChemGraph(**kw)])
 
 

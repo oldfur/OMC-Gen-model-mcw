@@ -25,6 +25,7 @@ from mattergen.assignment.joint_assignment_diffusion.metrics import (
 from mattergen.assignment.joint_assignment_diffusion.schedule import AsyncJumpSchedule
 from mattergen.assignment.joint_assignment_diffusion.state import a_from_role_and_copy
 from mattergen.assignment.noisy_copy_assignment.gemnet_loader import load_molecular_csp_gemnet
+# evaluate path currently uses CTMC-only metrics; geometry ChemGraph not required here
 
 
 def main() -> None:

@@ -24,24 +24,39 @@ from mattergen.assignment.joint_assignment_diffusion.metrics import (
 from mattergen.assignment.joint_assignment_diffusion.sampler import sample_joint_prior_and_trajectory
 from mattergen.assignment.joint_assignment_diffusion.schedule import AsyncJumpSchedule
 from mattergen.assignment.joint_assignment_diffusion.ctmc import CTMCTrajectory
-from mattergen.assignment.noisy_copy_assignment.gemnet_loader import load_molecular_csp_gemnet
+from mattergen.assignment.noisy_copy_assignment.gemnet_loader import (
+    build_mol_conditioning_from_sample,
+    load_molecular_csp_gemnet,
+)
 from mattergen.common.data.chemgraph import ChemGraph
 
 
 def build_cg(sample, frac, cell):
     n = int(sample["N"])
     lat = cell if cell.ndim == 3 else cell.unsqueeze(0)
-    return Batch.from_data_list(
-        [
-            ChemGraph(
-                atomic_numbers=sample["z"].long(),
-                pos=frac,
-                cell=lat,
-                num_atoms=torch.tensor([n], dtype=torch.long, device=frac.device),
-                num_nodes=n,
-            )
-        ]
+    device = frac.device
+    mol_extra = build_mol_conditioning_from_sample(
+        {
+            "z": sample["z"],
+            "role": sample["role"],
+            "copy": sample["copy"],
+            "role_edge_index": sample["role_edge_index"],
+            "role_bond_type": sample["role_bond_type"],
+        }
     )
+    kw = dict(
+        atomic_numbers=sample["z"].long().to(device),
+        pos=frac,
+        cell=lat.to(device),
+        num_atoms=torch.tensor([n], dtype=torch.long, device=device),
+        num_nodes=n,
+    )
+    for k, v in mol_extra.items():
+        if k == "mol_copy_id":
+            continue
+        if torch.is_tensor(v):
+            kw[k] = v.to(device)
+    return Batch.from_data_list([ChemGraph(**kw)])
 
 
 def main() -> None:
