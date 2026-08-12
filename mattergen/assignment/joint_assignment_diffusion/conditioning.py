@@ -4,8 +4,6 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .state import JointAssignmentState
-
 
 class OrbitRelationTable(nn.Module):
     """Learned embedding of orbit-pair molecular relation ρ_{oo'}."""
@@ -92,7 +90,11 @@ class ClockEmbedding(nn.Module):
 
 
 class AssignmentGraphMP(nn.Module):
-    """Nonlocal same-copy invariant message passing (no distance/angle)."""
+    """Nonlocal same-copy invariant message passing (no distance/angle).
+
+    Vectorized over same-copy ordered pairs (i≠j); math identical to the
+    previous per-pair Python loop.
+    """
 
     def __init__(self, hidden: int, edge_dim: int):
         super().__init__()
@@ -117,49 +119,68 @@ class AssignmentGraphMP(nn.Module):
     ) -> torch.Tensor:
         n = h.shape[0]
         device = h.device
-        # same-copy pairs (i!=j)
+        dtype = h.dtype
         msgs = torch.zeros_like(h)
-        counts = torch.zeros(n, 1, device=device)
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    continue
-                if int(copy_of[i]) != int(copy_of[j]):
-                    continue
-                oi = int(orbit_of[i])
-                oj = int(orbit_of[j])
-                rel = rho(
-                    torch.tensor(oi, device=device),
-                    torch.tensor(oj, device=device),
-                )
-                feat = torch.cat([h[i], h[j], rel], dim=-1)
-                msgs[i] = msgs[i] + self.msg(feat)
-                counts[i] += 1
+        counts = torch.zeros(n, 1, device=device, dtype=dtype)
+        if n <= 1:
+            return self.upd(torch.cat([h, msgs], dim=-1))
+
+        copy_of = copy_of.long()
+        orbit_of = orbit_of.long()
+        # Group by copy id (K is small); form all ordered pairs i≠j within each copy.
+        max_k = int(copy_of.max().item()) if copy_of.numel() else -1
+        for k in range(max_k + 1):
+            idx = (copy_of == k).nonzero(as_tuple=True)[0]
+            m = int(idx.numel())
+            if m < 2:
+                continue
+            # Cartesian product of indices in this copy, drop diagonal.
+            src = idx.repeat_interleave(m)
+            dst = idx.repeat(m)
+            keep = src != dst
+            src = src[keep]
+            dst = dst[keep]
+            rel = rho(orbit_of[src], orbit_of[dst])
+            feat = torch.cat([h[src], h[dst], rel], dim=-1)
+            m_ij = self.msg(feat)
+            msgs.index_add_(0, src, m_ij)
+            counts.index_add_(
+                0, src, torch.ones(src.shape[0], 1, device=device, dtype=dtype)
+            )
         msgs = msgs / counts.clamp_min(1.0)
         return self.upd(torch.cat([h, msgs], dim=-1))
 
 
 class CopyContextPool(nn.Module):
-    """Copy contexts v_k without copy-ID embeddings."""
+    """Copy contexts v_k without copy-ID embeddings (vectorized index_add)."""
 
     def __init__(self, hidden: int):
         super().__init__()
         self.psi = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
         self.phi = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
 
-    def forward(self, h: torch.Tensor, orbit_of: torch.Tensor, copy_of: torch.Tensor, z_orbit: torch.Tensor, K: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        h: torch.Tensor,
+        orbit_of: torch.Tensor,
+        copy_of: torch.Tensor,
+        z_orbit: torch.Tensor,
+        K: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n, hid = h.shape
         device = h.device
-        v = torch.zeros(K, hid, device=device)
-        counts = torch.zeros(K, 1, device=device)
-        for i in range(n):
-            k = int(copy_of[i])
-            o = int(orbit_of[i])
-            feat = torch.cat([h[i], z_orbit[o]], dim=-1)
-            v[k] = v[k] + self.psi(feat)
-            counts[k] += 1
+        dtype = h.dtype
+        k = copy_of.long()
+        o = orbit_of.long()
+        feat = torch.cat([h, z_orbit[o]], dim=-1)
+        psi = self.psi(feat)
+        v = torch.zeros(K, hid, device=device, dtype=dtype)
+        counts = torch.zeros(K, 1, device=device, dtype=dtype)
+        if n > 0:
+            v.index_add_(0, k, psi)
+            counts.index_add_(0, k, torch.ones(n, 1, device=device, dtype=dtype))
         v = v / counts.clamp_min(1.0)
-        c_i = v[copy_of]  # [N, H]
+        c_i = v[k] if n > 0 else torch.zeros(0, hid, device=device, dtype=dtype)
         v_a = self.phi(v.mean(0, keepdim=False))
         return v, c_i, v_a
 

@@ -25,20 +25,19 @@ def enumerate_r_moves(state: JointAssignmentState) -> list[LegalMove]:
     k_i = k_j, z_i = z_j, o_i ≠ o_j.
     """
     n = state.N
+    if n < 2:
+        return []
     orbit = state.orbit_of()
     copy = state.copy_of()
     z = state.atomic_numbers
-    moves: list[LegalMove] = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            if int(copy[i]) != int(copy[j]):
-                continue
-            if int(z[i]) != int(z[j]):
-                continue
-            if int(orbit[i]) == int(orbit[j]):
-                continue
-            moves.append(LegalMove("R", i, j))
-    return moves
+    device = state.A.device
+    ii, jj = torch.triu_indices(n, n, offset=1, device=device)
+    mask = (copy[ii] == copy[jj]) & (z[ii] == z[jj]) & (orbit[ii] != orbit[jj])
+    ii = ii[mask]
+    jj = jj[mask]
+    if ii.numel() == 0:
+        return []
+    return [LegalMove("R", int(i), int(j)) for i, j in zip(ii.tolist(), jj.tolist())]
 
 
 def enumerate_g_moves(state: JointAssignmentState) -> list[LegalMove]:
@@ -47,17 +46,18 @@ def enumerate_g_moves(state: JointAssignmentState) -> list[LegalMove]:
     o_i = o_j, k_i ≠ k_j.
     """
     n = state.N
+    if n < 2:
+        return []
     orbit = state.orbit_of()
     copy = state.copy_of()
-    moves: list[LegalMove] = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            if int(orbit[i]) != int(orbit[j]):
-                continue
-            if int(copy[i]) == int(copy[j]):
-                continue
-            moves.append(LegalMove("G", i, j))
-    return moves
+    device = state.A.device
+    ii, jj = torch.triu_indices(n, n, offset=1, device=device)
+    mask = (orbit[ii] == orbit[jj]) & (copy[ii] != copy[jj])
+    ii = ii[mask]
+    jj = jj[mask]
+    if ii.numel() == 0:
+        return []
+    return [LegalMove("G", int(i), int(j)) for i, j in zip(ii.tolist(), jj.tolist())]
 
 
 def enumerate_legal_moves(state: JointAssignmentState) -> dict[str, list[LegalMove]]:

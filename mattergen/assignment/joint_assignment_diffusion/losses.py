@@ -1,17 +1,24 @@
 """Joint losses: MatterGen geometry + reverse CTMC point-process NLL for R/G."""
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 
 from mattergen.assignment.soft_c_geometry_feedback_n2.geometry_loss import mattergen_geometry_loss
 
 from .ctmc import CTMCTrajectory
-from .jump_heads import logits_to_rates
-from .legal_moves import enumerate_legal_moves
-from .schedule import AsyncJumpSchedule
+from .legal_moves import LegalMove, apply_move
 from .state import JointAssignmentState
+
+
+def _pair_key(i: int, j: int) -> tuple[int, int]:
+    return (i, j) if i < j else (j, i)
+
+
+def _rate_mass(rates: list, *, device, dtype=torch.float32) -> torch.Tensor:
+    """Σ r_m over move pool; empty → 0 (same NLL as skipping empty pools)."""
+    if not rates:
+        return torch.zeros((), device=device, dtype=dtype)
+    return torch.stack([r for _, r in rates]).sum()
 
 
 def reverse_ctmc_segment_nll(
@@ -31,6 +38,8 @@ def reverse_ctmc_segment_nll(
     reverse rates evaluated at fixed (X_t, L_t) geometry (A-first Lie).
 
     L = ∫ λ_θ dτ − Σ log r_m(τ_e)  (for reverse events).
+
+    Engineering only: dict rate lookup; same quadrature / event semantics.
     """
     device = t_geom.device
     # collect reverse events in (s,t] = (t_start, t_end]
@@ -47,53 +56,43 @@ def reverse_ctmc_segment_nll(
 
     integrated_r = torch.zeros((), device=device)
     integrated_g = torch.zeros((), device=device)
+    du = delta / n_quad
     for q in range(n_quad):
         # midpoint
-        u = (q + 0.5) / n_quad * delta
+        u = (q + 0.5) * du
         t_fwd = t_end - u
         # state just after reverse progress: walk reverse events
         # approx: use traj.state_at(t_fwd)
         st = traj.state_at(t_fwd)
         out = model(chemgraph_t, t_geom, st, compute_jumps=True)
-        # total rate mass
-        for kind, integ in (("R", "r"), ("G", "g")):
-            rates = out.move_rates[kind]
-            if not rates:
-                continue
-            tot = torch.stack([r for _, r in rates]).sum()
-            if kind == "R":
-                integrated_r = integrated_r + tot * (delta / n_quad)
-            else:
-                integrated_g = integrated_g + tot * (delta / n_quad)
+        integrated_r = integrated_r + _rate_mass(out.move_rates.get("R", []), device=device) * du
+        integrated_g = integrated_g + _rate_mass(out.move_rates.get("G", []), device=device) * du
 
     # event log-likelihood (reverse)
     log_r = torch.zeros((), device=device)
     log_g = torch.zeros((), device=device)
     # reverse path states: start from traj.state_at(t_end)
     st = traj.state_at(t_end).clone()
+    pen = torch.tensor(20.0, device=device)
     for e in rev_events:
         # reverse event undoes forward swap: same swap
         out = model(chemgraph_t, t_geom, st, compute_jumps=True)
-        found = None
         kind = e.kind
-        for m, r in out.move_rates[kind]:
-            if {m.i, m.j} == {e.i, e.j}:
-                found = r
-                break
+        # O(1) pair lookup instead of linear scan over move list
+        rate_map = {_pair_key(m.i, m.j): r for m, r in out.move_rates.get(kind, [])}
+        found = rate_map.get(_pair_key(e.i, e.j))
         if found is None:
             # illegal under reverse state — large penalty
-            pen = torch.tensor(20.0, device=device)
             if kind == "R":
                 log_r = log_r - pen
             else:
                 log_g = log_g - pen
         else:
+            log_term = torch.log(found.clamp_min(1e-12))
             if kind == "R":
-                log_r = log_r + torch.log(found.clamp_min(1e-12))
+                log_r = log_r + log_term
             else:
-                log_g = log_g + torch.log(found.clamp_min(1e-12))
-        from .legal_moves import LegalMove, apply_move
-
+                log_g = log_g + log_term
         st = apply_move(st, LegalMove(kind, e.i, e.j))
 
     L_R = integrated_r - log_r

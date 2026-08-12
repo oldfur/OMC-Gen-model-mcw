@@ -105,3 +105,67 @@ def test_symmetry_preserves_capacity():
     aug = sample_symmetry_augment(atomic_numbers=st.atomic_numbers, K=st.K, generator=torch.Generator().manual_seed(2))
     st2 = apply_symmetry_to_state(st, aug)
     assert st2.validate()["legal"]
+
+
+def test_vectorized_assign_mp_matches_loop():
+    """Engineering: AssignmentGraphMP vector path == O(N²) reference loop."""
+    from mattergen.assignment.joint_assignment_diffusion.conditioning import (
+        AssignmentGraphMP,
+        OrbitRelationTable,
+    )
+
+    st, partition, _ = _toy_state()
+    H = 16
+    mp = AssignmentGraphMP(hidden=H, edge_dim=32)
+    rho = OrbitRelationTable(num_orbits=partition.J, dim=32)
+    for p in mp.parameters():
+        if p.dim() >= 2:
+            torch.nn.init.xavier_uniform_(p)
+        else:
+            torch.nn.init.uniform_(p, -0.1, 0.1)
+    h = torch.randn(st.N, H)
+    copy_of, orbit_of = st.copy_of(), st.orbit_of()
+    # reference loop (pre-vectorization semantics)
+    msgs = torch.zeros_like(h)
+    counts = torch.zeros(st.N, 1)
+    for i in range(st.N):
+        for j in range(st.N):
+            if i == j or int(copy_of[i]) != int(copy_of[j]):
+                continue
+            rel = rho(
+                torch.tensor(int(orbit_of[i])),
+                torch.tensor(int(orbit_of[j])),
+            )
+            feat = torch.cat([h[i], h[j], rel], dim=-1)
+            msgs[i] = msgs[i] + mp.msg(feat)
+            counts[i] += 1
+    ref = mp.upd(torch.cat([h, msgs / counts.clamp_min(1.0)], dim=-1))
+    got = mp(h, copy_of=copy_of, orbit_of=orbit_of, z_orbit=torch.randn(partition.J, H), rho=rho)
+    assert torch.allclose(ref, got, atol=1e-5)
+
+
+def test_enumerate_moves_vectorized_matches_bruteforce():
+    st, _, _ = _toy_state()
+    from mattergen.assignment.joint_assignment_diffusion.legal_moves import (
+        enumerate_g_moves,
+        enumerate_r_moves,
+    )
+
+    orbit, copy, z = st.orbit_of(), st.copy_of(), st.atomic_numbers
+    n = st.N
+    brute_r = {
+        (i, j)
+        for i in range(n)
+        for j in range(i + 1, n)
+        if int(copy[i]) == int(copy[j])
+        and int(z[i]) == int(z[j])
+        and int(orbit[i]) != int(orbit[j])
+    }
+    brute_g = {
+        (i, j)
+        for i in range(n)
+        for j in range(i + 1, n)
+        if int(orbit[i]) == int(orbit[j]) and int(copy[i]) != int(copy[j])
+    }
+    assert {(m.i, m.j) for m in enumerate_r_moves(st)} == brute_r
+    assert {(m.i, m.j) for m in enumerate_g_moves(st)} == brute_g

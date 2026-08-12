@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 from torch import nn
 
-from mattergen.assignment.noisy_copy_assignment.gemnet_loader import parameter_sha256
 from mattergen.common.data.chemgraph import ChemGraph
-from mattergen.denoiser import GemNetTDenoiser
+from mattergen.denoiser import GemNetTDenoiser, get_chemgraph_from_denoiser_output
+from mattergen.property_embeddings import get_property_embeddings
 
 from .conditioning import (
     AssignmentGraphMP,
@@ -112,7 +111,6 @@ class JointAXLModel(nn.Module):
         orbit_of = state.orbit_of()
         copy_of = state.copy_of()
         C = state.C()
-        # provisional h for assign graph uses orbit emb only (pre-gemnet); fusion uses post-pass
         beta_r = float(self.schedule.beta_r(t_scalar).item())
         beta_g = float(self.schedule.beta_g(t_scalar).item())
         lock = float(int(self.schedule.is_r_locked(t_scalar)) + 2 * int(self.schedule.is_g_locked(t_scalar)))
@@ -138,14 +136,13 @@ class JointAXLModel(nn.Module):
             )
             return delta
 
-        # mid-block fusion uses post-int hidden; filled in after first forward if needed
         def mid_block_node_fn(h, block_idx):
             # nonlocal same-copy MP residual
             delta = self.assign_mp(
                 h, copy_of=copy_of, orbit_of=orbit_of, z_orbit=z_orbit, rho=self.rho
             )
             # copy context residual
-            v, c_i, _va = self.copy_pool(h, orbit_of, copy_of, z_orbit, state.K)
+            _v, c_i, _va = self.copy_pool(h, orbit_of, copy_of, z_orbit, state.K)
             return delta + self.copy_to_node(c_i)
 
         scf = {
@@ -166,60 +163,17 @@ class JointAXLModel(nn.Module):
         }
         return scf, meta
 
-    def forward(
+    def _denoiser_forward_once(
         self,
         chemgraph: ChemGraph,
         t: torch.Tensor,
-        state: JointAssignmentState,
-        *,
-        compute_jumps: bool = True,
-    ) -> JointModelOutput:
-        # NoiseLevelEncoding expects t.shape == [batch_size], not a 0-dim scalar.
-        t = torch.as_tensor(t, device=chemgraph["pos"].device, dtype=torch.float32).reshape(-1)
-        t_scalar = float(t[0].item())
-        scf, meta = self._build_a_feedback(state, t_scalar=t_scalar)
-        scores = self.denoiser(chemgraph, t, soft_c_feedback=scf)
-        # Recover node embeddings via a second light path: use GemNet hidden from feedback
-        # Re-run gemnet extractor-like path for jump heads
-        h = self._extract_node_hidden(chemgraph, t, scf)
-        z_orbit = meta["z_orbit"]
-        orbit_of = meta["orbit_of"]
-        copy_of = meta["copy_of"]
-        v, c_i, v_a = self.copy_pool(h, orbit_of, copy_of, z_orbit, state.K)
-        move_logits = {}
-        move_rates = {}
-        if compute_jumps:
-            moves = enumerate_legal_moves(state)
-            scored = compute_move_logits(
-                moves=moves,
-                h=h,
-                state=state,
-                z_orbit=z_orbit,
-                c_i=c_i,
-                v_copies=v,
-                rho_table=self.rho,
-                r_head=self.r_head,
-                g_head=self.g_head,
-            )
-            move_logits = scored
-            move_rates = logits_to_rates(
-                scored,
-                beta_r=meta["beta_r"],
-                beta_g=meta["beta_g"],
-            )
-        return JointModelOutput(
-            chemgraph_scores=scores,
-            node_hidden=h,
-            move_logits=move_logits,
-            move_rates=move_rates,
-            diagnostics={**meta, "v_A": v_a, "num_r_moves": len(move_logits.get("R", [])), "num_g_moves": len(move_logits.get("G", []))},
-        )
+        scf: dict,
+    ) -> tuple[ChemGraph, torch.Tensor]:
+        """Single GemNet path → ChemGraph scores + node_embeddings.
 
-    def _extract_node_hidden(self, chemgraph: ChemGraph, t: torch.Tensor, scf: dict) -> torch.Tensor:
-        """Mirror GemNet path to node embeddings with A conditioning (shared weights)."""
-        # Use denoiser gemnet forward and read node_embeddings from ModelOutput-like dict
-        from mattergen.property_embeddings import get_property_embeddings
-
+        Mirrors ``GemNetTDenoiser.forward`` but returns node hidden as well so
+        jump heads do not require a second full GemNet pass.
+        """
         x = chemgraph
         frac_coords, lattice, atom_types, num_atoms, batch = (
             x["pos"],
@@ -245,7 +199,7 @@ class JointAXLModel(nn.Module):
                 min_scale = float(self.denoiser.molecule_conditioner_gate_min_scale)
                 gate = min_scale + (1.0 - min_scale) * gate
                 node_condition = node_condition * gate[batch].unsqueeze(-1)
-        out = self.denoiser.gemnet(
+        output = self.denoiser.gemnet(
             z=z_per,
             frac_coords=frac_coords,
             atom_types=atom_types,
@@ -260,4 +214,67 @@ class JointAXLModel(nn.Module):
             node_condition=node_condition,
             soft_c_feedback=scf,
         )
-        return out.node_embeddings
+        h = output.node_embeddings
+        pred_atom_types = self.denoiser.fc_atom(h)
+        scores = get_chemgraph_from_denoiser_output(
+            pred_atom_types=pred_atom_types,
+            pred_lattice_eps=output.stress,
+            pred_cart_pos_eps=output.forces,
+            training=self.denoiser.training,
+            element_mask_func=self.denoiser.element_mask_func,
+            x_input=x,
+        )
+        return scores, h
+
+    def forward(
+        self,
+        chemgraph: ChemGraph,
+        t: torch.Tensor,
+        state: JointAssignmentState,
+        *,
+        compute_jumps: bool = True,
+    ) -> JointModelOutput:
+        # NoiseLevelEncoding expects t.shape == [batch_size], not a 0-dim scalar.
+        t = torch.as_tensor(t, device=chemgraph["pos"].device, dtype=torch.float32).reshape(-1)
+        t_scalar = float(t[0].item())
+        scf, meta = self._build_a_feedback(state, t_scalar=t_scalar)
+        # One GemNet only (scores + node_embeddings).
+        scores, h = self._denoiser_forward_once(chemgraph, t, scf)
+        z_orbit = meta["z_orbit"]
+        orbit_of = meta["orbit_of"]
+        copy_of = meta["copy_of"]
+        move_logits: dict = {}
+        move_rates: dict = {}
+        v_a = None
+        if compute_jumps:
+            v, c_i, v_a = self.copy_pool(h, orbit_of, copy_of, z_orbit, state.K)
+            moves = enumerate_legal_moves(state)
+            scored = compute_move_logits(
+                moves=moves,
+                h=h,
+                state=state,
+                z_orbit=z_orbit,
+                c_i=c_i,
+                v_copies=v,
+                rho_table=self.rho,
+                r_head=self.r_head,
+                g_head=self.g_head,
+            )
+            move_logits = scored
+            move_rates = logits_to_rates(
+                scored,
+                beta_r=meta["beta_r"],
+                beta_g=meta["beta_g"],
+            )
+        return JointModelOutput(
+            chemgraph_scores=scores,
+            node_hidden=h,
+            move_logits=move_logits,
+            move_rates=move_rates,
+            diagnostics={
+                **meta,
+                "v_A": v_a,
+                "num_r_moves": len(move_logits.get("R", [])),
+                "num_g_moves": len(move_logits.get("G", [])),
+            },
+        )
