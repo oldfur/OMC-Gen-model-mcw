@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from .g_teacher import f1_vs_c0
+from .legal_moves import LegalMove, apply_move
 from .metrics import assignment_distances
 from .sampler import _gillespie_step_a_integrated
 from .state import JointAssignmentState
@@ -18,7 +20,8 @@ G_BINS: list[tuple[float, float, str]] = [
     (0.50, 0.55, "[0.50,0.55)"),
     (0.55, 0.60, "[0.55,0.60)"),
     (0.60, 0.65, "[0.60,0.65)"),
-    (0.65, 0.751, "[0.65,0.75]"),
+    (0.65, 0.70, "[0.65,0.70)"),
+    (0.70, 0.751, "[0.70,0.75]"),
 ]
 
 R_BINS: list[tuple[float, float, str]] = [
@@ -48,8 +51,8 @@ def _run_reverse(
     s: float,
     generator: torch.Generator,
     policy: str,
-) -> JointAssignmentState:
-    st, _ev, _d = _gillespie_step_a_integrated(
+):
+    st, ev, _d = _gillespie_step_a_integrated(
         model,
         chemgraph,
         t,
@@ -59,7 +62,31 @@ def _run_reverse(
         static_A=False,
         policy=policy,
     )
-    return st
+    return st, ev
+
+
+def _g_jump_c0_stats(state0: JointAssignmentState, events, c0: torch.Tensor) -> dict[str, float]:
+    """Clean-directed ΔF1 of executed G jumps along a reverse path."""
+    st = state0.clone()
+    n_g = 0
+    n_imp = 0
+    sum_df1 = 0.0
+    for e in events:
+        if e.kind != "G":
+            st = apply_move(st, LegalMove(e.kind, e.i, e.j))
+            continue
+        f_before = f1_vs_c0(st, c0)
+        st = apply_move(st, LegalMove("G", e.i, e.j))
+        df1 = f1_vs_c0(st, c0) - f_before
+        n_g += 1
+        sum_df1 += df1
+        if df1 > 0:
+            n_imp += 1
+    return {
+        "n_g_jumps": float(n_g),
+        "frac_g_jumps_improving_c0": (n_imp / n_g) if n_g else 0.0,
+        "mean_g_jump_delta_f1_c0": (sum_df1 / n_g) if n_g else 0.0,
+    }
 
 
 def evaluate_local_reverse_pair(
@@ -71,16 +98,17 @@ def evaluate_local_reverse_pair(
     t: float,
     s: float,
     seed: int,
+    c0: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Paired learned vs uniform reverse on the same (A_t, X_t, [s,t], seed)."""
     g_learn = torch.Generator().manual_seed(int(seed))
     g_uni = torch.Generator().manual_seed(int(seed))
     with torch.no_grad():
-        hat = _run_reverse(
+        hat, ev_hat = _run_reverse(
             model=model, chemgraph=chemgraph_t, state_t=state_t, t=t, s=s,
             generator=g_learn, policy="learned",
         )
-        uni = _run_reverse(
+        uni, ev_uni = _run_reverse(
             model=model, chemgraph=chemgraph_t, state_t=state_t, t=t, s=s,
             generator=g_uni, policy="uniform",
         )
@@ -120,6 +148,15 @@ def evaluate_local_reverse_pair(
     row["win_orbit"] = float(row["delta_d_orbit_learned"] > row["delta_d_orbit_uniform"] + 1e-12)
     row["win_ari"] = float(row["delta_d_ari_learned"] > row["delta_d_ari_uniform"] + 1e-12)
     row["win_f1"] = float(row["delta_d_f1_learned"] > row["delta_d_f1_uniform"] + 1e-12)
+    if c0 is not None:
+        lg = _g_jump_c0_stats(state_t, ev_hat, c0)
+        ug = _g_jump_c0_stats(state_t, ev_uni, c0)
+        row["learned_frac_g_improving_c0"] = lg["frac_g_jumps_improving_c0"]
+        row["uniform_frac_g_improving_c0"] = ug["frac_g_jumps_improving_c0"]
+        row["learned_mean_g_jump_delta_f1_c0"] = lg["mean_g_jump_delta_f1_c0"]
+        row["uniform_mean_g_jump_delta_f1_c0"] = ug["mean_g_jump_delta_f1_c0"]
+        row["learned_n_g_jumps"] = lg["n_g_jumps"]
+        row["uniform_n_g_jumps"] = ug["n_g_jumps"]
     return row
 
 
@@ -144,6 +181,10 @@ def summarize_reverse_eval(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "learned_beats_uniform_orbit": _mean("delta_d_orbit_learned") > _mean("delta_d_orbit_uniform"),
         "learned_beats_uniform_ari": _mean("delta_d_ari_learned") > _mean("delta_d_ari_uniform"),
         "learned_beats_uniform_f1": _mean("delta_d_f1_learned") > _mean("delta_d_f1_uniform"),
+        "learned_frac_g_improving_c0": _mean("learned_frac_g_improving_c0") if rows and "learned_frac_g_improving_c0" in rows[0] else 0.0,
+        "uniform_frac_g_improving_c0": _mean("uniform_frac_g_improving_c0") if rows and "uniform_frac_g_improving_c0" in rows[0] else 0.0,
+        "learned_mean_g_jump_delta_f1_c0": _mean("learned_mean_g_jump_delta_f1_c0") if rows and "learned_mean_g_jump_delta_f1_c0" in rows[0] else 0.0,
+        "uniform_mean_g_jump_delta_f1_c0": _mean("uniform_mean_g_jump_delta_f1_c0") if rows and "uniform_mean_g_jump_delta_f1_c0" in rows[0] else 0.0,
         "by_g_bin": {},
         "by_r_bin": {},
     }
@@ -163,6 +204,8 @@ def summarize_reverse_eval(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "uniform_orbit_acc": _mean("uniform_orbit_acc", sub),
                 "learned_ARI": _mean("learned_ARI", sub),
                 "uniform_ARI": _mean("uniform_ARI", sub),
+                "learned_f1": _mean("learned_f1", sub),
+                "uniform_f1": _mean("uniform_f1", sub),
             }
     return out
 
@@ -170,6 +213,41 @@ def summarize_reverse_eval(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def event_bin_name(kind: str, t: float) -> str:
     bins = G_BINS if kind == "G" else R_BINS
     return bin_label(t, bins) or "other"
+
+
+def aggregate_g_teacher_bins(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate G teacher-learning metrics into time bins + 0.40-0.50 / 0.50-0.60."""
+    g_recs = [r for r in records if r.get("kind") == "G"]
+
+    def _agg(recs: list[dict]) -> dict[str, Any]:
+        if not recs:
+            return {"n": 0}
+        def m(k, default=0.0):
+            xs = [float(r.get(k, default)) for r in recs if r.get(k) is not None]
+            return float(sum(xs) / len(xs)) if xs else 0.0
+        return {
+            "n": len(recs),
+            "delta_teacher_CE": m("delta_CE_teacher"),
+            "P_beneficial": m("P_beneficial"),
+            "P_best": m("P_best"),
+            "top1_beneficial_rate": m("top1_is_beneficial"),
+            "top1_best_rate": m("top1_is_best"),
+            "mean_top1_delta_F1": m("top1_delta_F1"),
+            "expected_delta_F1_under_pi": m("expected_delta_F1"),
+            "uniform_expected_delta_F1": m("uniform_expected_delta_F1"),
+            "teacher_entropy": m("teacher_entropy_G"),
+            "teacher_effective_support": m("teacher_effective_support_G"),
+            "num_beneficial_G": m("num_beneficial_G"),
+            "historical_inverse_is_best": m("historical_inverse_is_best"),
+            "g_teacher_no_beneficial": m("g_teacher_no_beneficial"),
+        }
+
+    out: dict[str, Any] = {"all": _agg(g_recs), "by_bin": {}}
+    for _lo, _hi, name in G_BINS:
+        out["by_bin"][name] = _agg([r for r in g_recs if r.get("bin") == name])
+    out["t_040_050"] = _agg([r for r in g_recs if 0.40 <= float(r.get("tau", -1)) < 0.50])
+    out["t_050_060"] = _agg([r for r in g_recs if 0.50 <= float(r.get("tau", -1)) < 0.60])
+    return out
 
 
 def aggregate_event_bins(records: list[dict[str, Any]]) -> dict[str, Any]:

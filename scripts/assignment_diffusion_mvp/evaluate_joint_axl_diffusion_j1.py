@@ -209,6 +209,7 @@ def main() -> None:
                 t=t,
                 s=s,
                 seed=pair_seed,
+                c0=st0.C(),
             )
             reverse_rows.append(row)
             print(

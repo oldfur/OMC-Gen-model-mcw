@@ -17,6 +17,10 @@ joint_j1:
     kappa_r: 4.0
     kappa_g: 6.0
 
+  # J1.3-A: G teacher (historical | improvement_weighted)
+  g_supervision: improvement_weighted
+  g_teacher_temperature: 0.02
+
   loss:
     lambda_r: 1.0
     lambda_g: 1.0

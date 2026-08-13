@@ -120,12 +120,32 @@ def test_forward_ctmc_produces_g_and_r_events():
     assert n_R > 0, "R events must not systematically vanish"
 
 
+def test_g_teacher_support_only_beneficial_and_fallback():
+    from mattergen.assignment.joint_assignment_diffusion.g_teacher import improvement_weighted_teacher
+
+    utils = [
+        {"key": (0, 1), "u": 0.05, "delta_ari": 0.0, "move": None},
+        {"key": (0, 2), "u": 0.04, "delta_ari": 0.0, "move": None},
+        {"key": (1, 2), "u": -0.01, "delta_ari": 0.0, "move": None},
+    ]
+    tch = improvement_weighted_teacher(utils, temperature=0.02)
+    q = tch["q"]
+    assert abs(float(q.sum()) - 1.0) < 1e-6
+    assert float(q[2]) == 0.0
+    assert float(q[0]) > float(q[1]) > 0
+    assert tch["num_beneficial"] == 2
+    utils_none = [{"key": (0, 1), "u": -0.1, "delta_ari": 0.0, "move": None}]
+    tch2 = improvement_weighted_teacher(utils_none, temperature=0.02)
+    assert tch2["no_beneficial"]
+    assert abs(float(tch2["q"].sum()) - 1.0) < 1e-6
+
+
 def test_event_bin_labels_cover_g_window():
     from mattergen.assignment.joint_assignment_diffusion.reverse_eval import event_bin_name
 
     assert event_bin_name("G", 0.37) == "[0.35,0.40)"
     assert event_bin_name("G", 0.52) == "[0.50,0.55)"
-    assert event_bin_name("G", 0.70) == "[0.65,0.75]"
+    assert event_bin_name("G", 0.70) == "[0.70,0.75]"
     assert event_bin_name("R", 0.81) == "[0.80,0.85)"
 
 

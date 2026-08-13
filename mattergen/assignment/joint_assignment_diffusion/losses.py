@@ -9,6 +9,13 @@ import torch
 from mattergen.assignment.soft_c_geometry_feedback_n2.geometry_loss import mattergen_geometry_loss
 
 from .ctmc import CTMCTrajectory
+from .g_teacher import (
+    align_pi_to_utils,
+    g_move_utilities,
+    improvement_weighted_teacher,
+    policy_quality,
+    teacher_diagnostics,
+)
 from .jump_heads import jump_pool_diagnostics, logits_to_pi
 from .legal_moves import LegalMove, apply_move
 from .state import JointAssignmentState
@@ -223,6 +230,49 @@ def event_conditioned_assignment_ce(
         "num_legal": n_legal,
         "hit": hit,
         "chemgraph_scores": out.chemgraph_scores,
+    }
+
+
+def event_conditioned_g_teacher_ce(
+    *,
+    model,
+    chemgraph_t,
+    t: torch.Tensor,
+    state_after: JointAssignmentState,
+    c0: torch.Tensor,
+    copy0: torch.Tensor,
+    hist_i: int,
+    hist_j: int,
+    temperature: float,
+    clip: float = 8.0,
+) -> dict[str, Any]:
+    """G soft-target CE at (X_τ, L_τ, A_{τ+}) with improvement-weighted teacher.
+
+    L_G = -Σ_m q_m log π_G(m); rates still r=βπ (not trained as total hazard).
+    """
+    t = torch.as_tensor(t, dtype=torch.float32, device=chemgraph_t["pos"].device).reshape(-1)
+    out = model(chemgraph_t, t, state_after, compute_jumps=True)
+    utils = g_move_utilities(state_after, c0=c0, copy0=copy0)
+    teacher = improvement_weighted_teacher(utils, temperature=temperature)
+    pi_pool = logits_to_pi(out.move_logits, clip=clip).get("G", [])
+    pi = align_pi_to_utils(pi_pool, utils)
+    device = t.device
+    zero = torch.zeros((), device=device)
+    if pi.numel() == 0 or teacher["q"].numel() == 0:
+        ce = zero + 20.0
+        q_dev = teacher["q"]
+    else:
+        q_dev = teacher["q"].to(device=pi.device, dtype=pi.dtype)
+        ce = -(q_dev * pi.clamp_min(1e-12).log()).sum()
+    tdiag = teacher_diagnostics(utils=utils, teacher=teacher, hist_key=_pair_key(hist_i, hist_j))
+    pqual = policy_quality(utils=utils, teacher=teacher, pi=pi if pi.numel() else zero)
+    return {
+        "CE": ce,
+        "uniform_CE": pqual["uniform_CE_teacher"],
+        "delta_CE": pqual["delta_CE_teacher"],
+        "chemgraph_scores": out.chemgraph_scores,
+        **tdiag,
+        **pqual,
     }
 
 

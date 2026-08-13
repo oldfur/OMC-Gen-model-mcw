@@ -20,10 +20,15 @@ from mattergen.assignment.joint_assignment_diffusion.ctmc import simulate_forwar
 from mattergen.assignment.joint_assignment_diffusion.joint_model import JointAXLModel
 from mattergen.assignment.joint_assignment_diffusion.losses import (
     event_conditioned_assignment_ce,
+    event_conditioned_g_teacher_ce,
     geometry_step_loss,
 )
 from mattergen.assignment.soft_c_geometry_feedback_n2.geometry_loss import mattergen_geometry_loss
-from mattergen.assignment.joint_assignment_diffusion.reverse_eval import aggregate_event_bins, event_bin_name
+from mattergen.assignment.joint_assignment_diffusion.reverse_eval import (
+    aggregate_event_bins,
+    aggregate_g_teacher_bins,
+    event_bin_name,
+)
 from mattergen.assignment.joint_assignment_diffusion.schedule import AsyncJumpSchedule
 from mattergen.assignment.joint_assignment_diffusion.state import a_from_role_and_copy
 from mattergen.assignment.joint_assignment_diffusion.symmetry import (
@@ -177,6 +182,9 @@ def main() -> None:
         "ASSIGNMENT_LOSS": "event_conditioned_reverse_ce",
         "JOINT_TIME": "single_global_tau_or_t",
         "J1_2": "event_conditioned_assignment",
+        "J1_3A": "improvement_weighted_g_teacher",
+        "G_SUPERVISION": str((cfg.get("g_supervision") or "improvement_weighted")),
+        "G_TEACHER_TEMPERATURE": float((cfg.get("g_teacher_temperature") or 0.02)),
         "R_WINDOW": list(schedule.r_window),
         "G_WINDOW": list(schedule.g_window),
         "KAPPA_R": schedule.kappa_r,
@@ -202,6 +210,10 @@ def main() -> None:
         K=int(sample_d["Z"]),
     )
 
+    g_sup = str((cfg.get("g_supervision") or "improvement_weighted")).strip()
+    if g_sup not in ("historical", "improvement_weighted"):
+        raise ValueError(f"unknown g_supervision={g_sup}")
+    g_temp = float(cfg.get("g_teacher_temperature") or 0.02)
     event_records: list[dict] = []
     with (out / "training_trace.jsonl").open("w", buffering=1) as stream:
         for step in range(steps):
@@ -290,15 +302,28 @@ def main() -> None:
             ce_g = torch.zeros((), device=device)
             ev_diag: dict = {}
             if picked is not None:
-                ev_diag = event_conditioned_assignment_ce(
-                    model=model,
-                    chemgraph_t=noisy_cg,
-                    t=noisy.t,
-                    state_after=state_t,
-                    kind=picked.kind,
-                    i=picked.i,
-                    j=picked.j,
-                )
+                if picked.kind == "G" and g_sup == "improvement_weighted":
+                    ev_diag = event_conditioned_g_teacher_ce(
+                        model=model,
+                        chemgraph_t=noisy_cg,
+                        t=noisy.t,
+                        state_after=state_t,
+                        c0=st0.C(),
+                        copy0=st0.copy_of(),
+                        hist_i=picked.i,
+                        hist_j=picked.j,
+                        temperature=g_temp,
+                    )
+                else:
+                    ev_diag = event_conditioned_assignment_ce(
+                        model=model,
+                        chemgraph_t=noisy_cg,
+                        t=noisy.t,
+                        state_after=state_t,
+                        kind=picked.kind,
+                        i=picked.i,
+                        j=picked.j,
+                    )
                 L_geom, _gmet = mattergen_geometry_loss(
                     loss_fn=loss_fn,
                     corruption=noise.corruption,
@@ -311,23 +336,51 @@ def main() -> None:
                     ce_r = ev_diag["CE"]
                 else:
                     ce_g = ev_diag["CE"]
-                event_records.append(
-                    {
-                        "step": step,
-                        "kind": picked.kind,
-                        "tau": t_f,
-                        "bin": event_bin_name(picked.kind, t_f),
-                        "CE": float(ev_diag["CE"].detach()),
-                        "uniform_CE": float(ev_diag["uniform_CE"]),
-                        "delta_CE": float(ev_diag["delta_CE"]),
-                        "target_probability": float(ev_diag["target_probability"]),
-                        "target_rank": int(ev_diag["target_rank"]),
-                        "top1": float(ev_diag["top1"]),
-                        "top5": float(ev_diag["top5"]),
-                        "entropy": float(ev_diag["entropy"]),
-                        "num_legal": int(ev_diag["num_legal"]),
-                    }
-                )
+                rec = {
+                    "step": step,
+                    "kind": picked.kind,
+                    "tau": t_f,
+                    "bin": event_bin_name(picked.kind, t_f),
+                    "g_supervision": g_sup if picked.kind == "G" else "historical",
+                    "CE": float(ev_diag["CE"].detach()),
+                    "uniform_CE": float(ev_diag.get("uniform_CE", ev_diag.get("uniform_CE_teacher", 0.0))),
+                    "delta_CE": float(ev_diag.get("delta_CE", ev_diag.get("delta_CE_teacher", 0.0))),
+                }
+                # R historical diagnostics
+                for k in ("target_probability", "target_rank", "top1", "top5", "entropy", "num_legal"):
+                    if k in ev_diag:
+                        rec[k] = ev_diag[k] if not torch.is_tensor(ev_diag[k]) else float(ev_diag[k].detach())
+                # G teacher / policy diagnostics
+                for k in (
+                    "num_legal_G",
+                    "num_beneficial_G",
+                    "num_positive_teacher_support",
+                    "teacher_entropy_G",
+                    "teacher_effective_support_G",
+                    "teacher_max_prob_G",
+                    "best_delta_F1",
+                    "mean_positive_delta_F1",
+                    "historical_delta_F1",
+                    "historical_inverse_rank_by_utility",
+                    "historical_inverse_is_beneficial",
+                    "historical_inverse_is_best",
+                    "historical_inverse_teacher_mass",
+                    "g_teacher_no_beneficial",
+                    "CE_teacher",
+                    "delta_CE_teacher",
+                    "P_beneficial",
+                    "P_best",
+                    "top1_is_beneficial",
+                    "top1_is_best",
+                    "top1_delta_F1",
+                    "top1_delta_ARI",
+                    "expected_delta_F1",
+                    "uniform_expected_delta_F1",
+                ):
+                    if k in ev_diag and ev_diag[k] is not None:
+                        v = ev_diag[k]
+                        rec[k] = float(v) if not isinstance(v, bool) else float(v)
+                event_records.append(rec)
             else:
                 geom = geometry_step_loss(
                     model=model,
@@ -348,6 +401,7 @@ def main() -> None:
                 "step": step,
                 "global_t": t_f,
                 "t_focus": t_focus,
+                "g_supervision": g_sup,
                 "has_event_target": picked is not None,
                 "event_kind": None if picked is None else picked.kind,
                 "geometry_loss": float(L_geom.detach()),
@@ -356,15 +410,21 @@ def main() -> None:
                 "L_R": float(ce_r.detach()),
                 "L_G": float(ce_g.detach()),
                 "uniform_CE_R": float(ev_diag.get("uniform_CE", 0.0)) if picked is not None and picked.kind == "R" else 0.0,
-                "uniform_CE_G": float(ev_diag.get("uniform_CE", 0.0)) if picked is not None and picked.kind == "G" else 0.0,
+                "uniform_CE_G": float(ev_diag.get("uniform_CE_teacher", ev_diag.get("uniform_CE", 0.0))) if picked is not None and picked.kind == "G" else 0.0,
                 "delta_CE_R": float(ev_diag.get("delta_CE", 0.0)) if picked is not None and picked.kind == "R" else 0.0,
-                "delta_CE_G": float(ev_diag.get("delta_CE", 0.0)) if picked is not None and picked.kind == "G" else 0.0,
+                "delta_CE_G": float(ev_diag.get("delta_CE_teacher", ev_diag.get("delta_CE", 0.0))) if picked is not None and picked.kind == "G" else 0.0,
+                "P_beneficial": float(ev_diag.get("P_beneficial", 0.0)) if ev_diag else 0.0,
+                "P_best": float(ev_diag.get("P_best", 0.0)) if ev_diag else 0.0,
+                "expected_delta_F1": float(ev_diag.get("expected_delta_F1", 0.0)) if ev_diag else 0.0,
+                "uniform_expected_delta_F1": float(ev_diag.get("uniform_expected_delta_F1", 0.0)) if ev_diag else 0.0,
+                "top1_is_beneficial": float(ev_diag.get("top1_is_beneficial", 0.0)) if ev_diag else 0.0,
+                "g_teacher_no_beneficial": float(ev_diag.get("g_teacher_no_beneficial", 0.0)) if ev_diag else 0.0,
                 "target_probability": float(ev_diag.get("target_probability", 0.0)) if ev_diag else 0.0,
-                "target_rank": int(ev_diag.get("target_rank", -1)) if ev_diag else -1,
-                "top1": float(ev_diag.get("top1", 0.0)) if ev_diag else 0.0,
+                "target_rank": int(ev_diag.get("target_rank", ev_diag.get("historical_inverse_rank_by_utility", -1)) or -1) if ev_diag else -1,
+                "top1": float(ev_diag.get("top1", ev_diag.get("top1_is_best", 0.0))) if ev_diag else 0.0,
                 "top5": float(ev_diag.get("top5", 0.0)) if ev_diag else 0.0,
-                "entropy": float(ev_diag.get("entropy", 0.0)) if ev_diag else 0.0,
-                "num_legal": int(ev_diag.get("num_legal", 0)) if ev_diag else 0,
+                "entropy": float(ev_diag.get("entropy", ev_diag.get("teacher_entropy_G", 0.0))) if ev_diag else 0.0,
+                "num_legal": int(ev_diag.get("num_legal", ev_diag.get("num_legal_G", 0))) if ev_diag else 0,
                 "total_loss": float(total.detach()),
                 "num_fwd_events": len(traj.events),
                 "n_R_fwd": n_R_all,
@@ -378,6 +438,7 @@ def main() -> None:
                 print(json.dumps(row), flush=True)
 
     (out / "event_bin_summary.json").write_text(json.dumps(aggregate_event_bins(event_records), indent=2))
+    (out / "g_teacher_bin_summary.json").write_text(json.dumps(aggregate_g_teacher_bins(event_records), indent=2))
     with (out / "event_bin_trace.jsonl").open("w") as ef:
         for rec in event_records:
             ef.write(json.dumps(rec) + "\n")
