@@ -19,7 +19,10 @@ from mattergen.assignment.global_copy_assembly.orbit_membership import build_orb
 from mattergen.assignment.joint_assignment_diffusion.ctmc import simulate_forward_ctmc
 from mattergen.assignment.joint_assignment_diffusion.joint_model import JointAXLModel
 from mattergen.assignment.joint_assignment_diffusion.losses import joint_training_step_losses
-from mattergen.assignment.joint_assignment_diffusion.schedule import AsyncJumpSchedule
+from mattergen.assignment.joint_assignment_diffusion.schedule import (
+    AsyncJumpSchedule,
+    next_reverse_grid_s,
+)
 from mattergen.assignment.joint_assignment_diffusion.state import a_from_role_and_copy
 from mattergen.assignment.joint_assignment_diffusion.symmetry import (
     apply_symmetry_to_geometry,
@@ -227,7 +230,15 @@ def main() -> None:
                 t_ten = noise.sample_t(1, device=device)
                 t_f = float(t_ten.reshape(-1)[0].item())
             t = torch.tensor([t_f], device=device, dtype=torch.float32)
+            # Reverse endpoint aligned with A-first Lie sampler grid (not s~U(0,t))
+            eval_grid = (cfg.get("evaluation") or {}).get("timesteps") or None
+            t_s = next_reverse_grid_s(t_f, eval_grid)
             state_t = traj.state_at(t_f)
+            state_s = traj.state_at(t_s)
+            H_R_to_t = schedule.integrated_beta(0.0, t_f, kind="R")
+            H_G_to_t = schedule.integrated_beta(0.0, t_f, kind="G")
+            H_R_seg = schedule.integrated_beta(t_s, t_f, kind="R")
+            H_G_seg = schedule.integrated_beta(t_s, t_f, kind="G")
 
             noisy = noise.corrupt_fixed_sample(
                 frac_coords_0=geo["pos"],
@@ -264,26 +275,27 @@ def main() -> None:
                 clean_cg=clean_cg,
                 noisy_cg=noisy_cg,
                 t=noisy.t,
+                t_s=t_s,
                 state_at_t=state_t,
                 traj=traj,
                 lambda_r=float(loss_w.get("lambda_r", 1.0)),
                 lambda_g=float(loss_w.get("lambda_g", 1.0)),
+                h_r_segment=H_R_seg,
+                h_g_segment=H_G_seg,
             )
             losses["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
             opt.step()
-            n_R = sum(1 for e in traj.events if e.kind == "R")
-            n_G = sum(1 for e in traj.events if e.kind == "G")
+            n_R_all = sum(1 for e in traj.events if e.kind == "R")
+            n_G_all = sum(1 for e in traj.events if e.kind == "G")
+            n_R_seg = sum(1 for e in traj.events_on_segment(t_s, t_f) if e.kind == "R")
+            n_G_seg = sum(1 for e in traj.events_on_segment(t_s, t_f) if e.kind == "G")
             H_R_full = schedule.integrated_beta(0.0, 1.0, kind="R")
             H_G_full = schedule.integrated_beta(0.0, 1.0, kind="G")
-            # segment for full forward path [0,1]; also report mass up to global_t
-            H_R_seg = H_R_full
-            H_G_seg = H_G_full
-            H_R_to_t = schedule.integrated_beta(0.0, t_f, kind="R")
-            H_G_to_t = schedule.integrated_beta(0.0, t_f, kind="G")
             row = {
                 "step": step,
                 "global_t": t_f,
+                "global_s": t_s,
                 "t_focus": t_focus,
                 "geometry_loss": float(losses["L_geom"].detach()),
                 "CE_R": float(losses["CE_R"].detach()),
@@ -296,10 +308,12 @@ def main() -> None:
                 "delta_CE_G": float(losses["delta_CE_G"].detach()),
                 "total_loss": float(losses["loss"].detach()),
                 "num_fwd_events": len(traj.events),
-                "n_R_fwd": n_R,
-                "n_G_fwd": n_G,
+                "n_R_fwd": n_R_all,
+                "n_G_fwd": n_G_all,
                 "n_R_events": float(losses["n_R_events"].detach()),
                 "n_G_events": float(losses["n_G_events"].detach()),
+                "n_R_events_segment": n_R_seg,
+                "n_G_events_segment": n_G_seg,
                 "num_legal_R": float(losses["num_legal_R"].detach()),
                 "num_legal_G": float(losses["num_legal_G"].detach()),
                 "H_R_full": H_R_full,
@@ -313,6 +327,7 @@ def main() -> None:
                 "beta_R_t": float(schedule.beta_r(t_f).item()),
                 "beta_G_t": float(schedule.beta_g(t_f).item()),
                 "state_t_legal": state_t.validate()["legal"],
+                "state_s_legal": state_s.validate()["legal"],
             }
             for k in ("entropy_R", "entropy_G", "logit_mean_R", "logit_mean_G"):
                 if k in losses:

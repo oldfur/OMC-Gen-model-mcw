@@ -1,4 +1,4 @@
-"""Joint losses: MatterGen geometry + event-mean categorical reverse jump NLL."""
+"""Joint losses: MatterGen geometry + event-mean CE on reverse segment (s, t]."""
 from __future__ import annotations
 
 import math
@@ -24,27 +24,24 @@ def reverse_categorical_jump_nll(
     chemgraph_t,
     traj: CTMCTrajectory,
     t_geom: torch.Tensor,
+    t_start: float,
+    t_end: float,
+    start_state: JointAssignmentState | None = None,
     kinds: tuple[str, ...] = ("R", "G"),
     clip: float = 8.0,
+    h_segment: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor | float | int]:
-    """Event-mean legal categorical NLL on reverse CTMC events.
+    """Event-mean legal CE on reverse events in (t_start, t_end] only.
 
-    With fixed total hazard Σ r = β(t), training only fits π:
-
-        L_a = (1/N_a) Σ_e -log π^a_{m_e}     (0 if N_a=0)
+        L_a = (1/N_a) Σ_{e ∈ E_{s:t} ∩ a} -log π^a_{m_e}     (0 if N_a=0)
         L_a^uniform = mean_e log |M_a|
         ΔL_a = L_a - L_a^uniform
+
+    Hard constraint: if H_a^{segment}=0 then N_a=0 and L_a=0.
+    Reverse walk starts at A_t (not A_1) and only undoes E_{s:t}.
     """
     device = t_geom.device
-    rev_events = list(reversed(list(traj.events)))
-
     zero = torch.zeros((), device=device)
-    L_sum = {k: zero.clone() for k in ("R", "G")}
-    L_uni_sum = {k: 0.0 for k in ("R", "G")}
-    n_ev = {k: 0 for k in ("R", "G")}
-    n_miss = {k: 0 for k in ("R", "G")}
-    last_diag: dict[str, Any] = {}
-
     empty = {
         "L_R": zero,
         "L_G": zero.clone(),
@@ -66,15 +63,30 @@ def reverse_categorical_jump_nll(
         "num_legal_R": 0,
         "num_legal_G": 0,
     }
-    if not rev_events:
+
+    # Strict local segment: (s, t]
+    seg = traj.events_on_segment(float(t_start), float(t_end))
+    h_seg = h_segment or {}
+    # Drop kinds whose segment hazard is (numerically) zero
+    allowed = set(kinds)
+    for kind in ("R", "G"):
+        if float(h_seg.get(kind, 1.0)) <= 1e-12:
+            allowed.discard(kind)
+    if not seg:
         return empty
 
-    st = traj.states[-1].clone()
+    st = (start_state or traj.state_at(float(t_end))).clone()
     pen = torch.tensor(20.0, device=device)
+    L_sum = {k: zero.clone() for k in ("R", "G")}
+    L_uni_sum = {k: 0.0 for k in ("R", "G")}
+    n_ev = {k: 0 for k in ("R", "G")}
+    n_miss = {k: 0 for k in ("R", "G")}
+    last_diag: dict[str, Any] = {}
 
-    for e in rev_events:
+    for e in reversed(seg):
         kind = e.kind
-        if kind in kinds:
+        score_this = kind in allowed
+        if score_this:
             out = model(chemgraph_t, t_geom, st, compute_jumps=True)
             scored = out.move_logits
             pi_pool = logits_to_pi(scored, clip=clip).get(kind, [])
@@ -123,7 +135,6 @@ def reverse_categorical_jump_nll(
         "L_G_uniform": L_uni["G"],
         "delta_L_R": _delta("R"),
         "delta_L_G": _delta("G"),
-        # aliases for remote logs
         "CE_R": float(L["R"].detach()),
         "CE_G": float(L["G"].detach()),
         "uniform_CE_R": float(L_uni["R"]),
@@ -148,21 +159,23 @@ def joint_training_step_losses(
     clean_cg,
     noisy_cg,
     t: torch.Tensor,
+    t_s: float,
     state_at_t: JointAssignmentState,
     traj: CTMCTrajectory,
     lambda_r: float = 1.0,
     lambda_g: float = 1.0,
+    h_r_segment: float = 0.0,
+    h_g_segment: float = 0.0,
 ) -> dict[str, torch.Tensor]:
-    """Single global time t: joint state (X_t, L_t, A_t).
+    """Joint sample S_t=(A_t,X_t,L_t); assignment CE only on E_{s:t}.
 
-    Geometry and assignment heads share the same (noisy_cg, t, A_t).
-    Async mobility is only via β_R(t), β_G(t) inside the CTMC / schedule.
+    Reverse targets are events with s < τ_e ≤ t, walked from A_t toward A_s.
     """
     t = torch.as_tensor(t, dtype=torch.float32).reshape(-1)
     if noisy_cg["pos"].device.type != "cpu":
         t = t.to(device=noisy_cg["pos"].device)
+    t_end = float(t[0].item())
 
-    # Geometry conditioned on A_t at the same global t
     geom_out = model(noisy_cg, t, state_at_t, compute_jumps=False)
     L_geom, metrics = mattergen_geometry_loss(
         loss_fn=loss_fn,
@@ -174,13 +187,16 @@ def joint_training_step_losses(
     )
 
     device = L_geom.device
-    # Single joint reverse-path categorical NLL for both R and G at same (X_t,t)
     nll = reverse_categorical_jump_nll(
         model=model,
         chemgraph_t=noisy_cg,
         traj=traj,
         t_geom=t,
+        t_start=float(t_s),
+        t_end=t_end,
+        start_state=state_at_t,
         kinds=("R", "G"),
+        h_segment={"R": float(h_r_segment), "G": float(h_g_segment)},
     )
     L_R = nll["L_R"]
     L_G = nll["L_G"]

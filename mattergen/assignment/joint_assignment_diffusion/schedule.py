@@ -271,3 +271,25 @@ class AsyncJumpSchedule:
     def expected_jump_budget(self) -> dict[str, float]:
         """E[N_a] = κ_a when legal moves always exist (upper reference)."""
         return {"R": float(self.kappa_r), "G": float(self.kappa_g), "total": float(self.kappa_r + self.kappa_g)}
+
+
+DEFAULT_REVERSE_GRID: tuple[float, ...] = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0)
+
+
+def next_reverse_grid_s(
+    t: float,
+    grid: Sequence[float] | None = None,
+) -> float:
+    """Sampler-aligned reverse endpoint: largest grid point strictly below t.
+
+    Matches A-first Lie macrostep (t → next lower grid). If t is already a
+    grid node, s is the following reverse step. Falls back to 0 when t is
+    at/below the last node.
+    """
+    pts = sorted({float(x) for x in (grid if grid is not None else DEFAULT_REVERSE_GRID)})
+    if not pts or pts[0] > 0.0:
+        pts = [0.0] + pts
+    below = [p for p in pts if p < float(t) - 1e-12]
+    if not below:
+        return 0.0
+    return float(below[-1])

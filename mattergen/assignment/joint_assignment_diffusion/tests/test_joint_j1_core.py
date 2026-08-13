@@ -120,6 +120,28 @@ def test_forward_ctmc_produces_g_and_r_events():
     assert n_R > 0, "R events must not systematically vanish"
 
 
+def test_next_reverse_grid_s_matches_sampler_macrostep():
+    from mattergen.assignment.joint_assignment_diffusion.schedule import next_reverse_grid_s
+
+    grid = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0]
+    assert abs(next_reverse_grid_s(0.73, grid) - 0.7) < 1e-12
+    assert abs(next_reverse_grid_s(0.9, grid) - 0.8) < 1e-12
+    assert abs(next_reverse_grid_s(0.05, grid) - 0.0) < 1e-12
+    assert abs(next_reverse_grid_s(0.0, grid) - 0.0) < 1e-12
+
+
+def test_events_on_segment_excludes_outside():
+    st, _, _ = _toy_state()
+    sch = AsyncJumpSchedule(r_window=(0.60, 0.95), g_window=(0.35, 0.75), kappa_r=4.0, kappa_g=6.0)
+    traj = simulate_forward_ctmc(st, schedule=sch, generator=torch.Generator().manual_seed(0))
+    # t below R window: no R events on (s, t]
+    t, s = 0.55, 0.5
+    seg = traj.events_on_segment(s, t)
+    assert all(e.kind != "R" for e in seg)
+    # empty / inverted
+    assert traj.events_on_segment(0.8, 0.8) == []
+
+
 def test_forward_inverse_hazard_matches_integral():
     sch = AsyncJumpSchedule(r_window=(0.60, 0.95), g_window=(0.35, 0.75), kappa_r=4.0, kappa_g=6.0)
     t0, t1 = 0.40, 0.70

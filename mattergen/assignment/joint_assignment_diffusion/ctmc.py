@@ -31,6 +31,10 @@ class CTMCTrajectory:
                 return self.states[k]
         return self.states[-1]
 
+    def events_on_segment(self, t_start: float, t_end: float) -> list[CTMCEvent]:
+        """Events with times in (t_start, t_end]."""
+        return [e for e in self.events if t_start < e.time <= t_end]
+
 
 def simulate_forward_ctmc(
     state0: JointAssignmentState,
