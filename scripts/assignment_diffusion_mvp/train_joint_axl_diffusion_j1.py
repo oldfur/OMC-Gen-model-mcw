@@ -155,7 +155,10 @@ def main() -> None:
 
     sch_cfg = cfg.get("schedule") or {}
     schedule = AsyncJumpSchedule.from_config(sch_cfg)
-    model = JointAXLModel(denoiser, num_orbits=partition.J, schedule=schedule).to(device)
+    g_ctx = str(cfg.get("g_copy_context_mode") or "orbit_slot")
+    model = JointAXLModel(
+        denoiser, num_orbits=partition.J, schedule=schedule, g_copy_context_mode=g_ctx
+    ).to(device)
     sample_d = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in sample.items()}
     model.set_orbit_relations(partition, sample_d["role_edge_index"], sample_d["role_bond_type"])
 
@@ -185,6 +188,7 @@ def main() -> None:
         "J1_3A": "improvement_weighted_g_teacher",
         "G_SUPERVISION": str((cfg.get("g_supervision") or "improvement_weighted")),
         "G_TEACHER_TEMPERATURE": float((cfg.get("g_teacher_temperature") or 0.02)),
+        "G_COPY_CONTEXT_MODE": str(cfg.get("g_copy_context_mode") or "orbit_slot"),
         "R_WINDOW": list(schedule.r_window),
         "G_WINDOW": list(schedule.g_window),
         "KAPPA_R": schedule.kappa_r,
@@ -376,6 +380,11 @@ def main() -> None:
                     "top1_delta_ARI",
                     "expected_delta_F1",
                     "uniform_expected_delta_F1",
+                    "g_copy_context_mode",
+                    "slot_embedding_norm_mean",
+                    "slot_embedding_norm_std",
+                    "slot_pair_feature_norm",
+                    "slot_orbit_pairwise_var",
                 ):
                     if k in ev_diag and ev_diag[k] is not None:
                         v = ev_diag[k]
@@ -402,6 +411,7 @@ def main() -> None:
                 "global_t": t_f,
                 "t_focus": t_focus,
                 "g_supervision": g_sup,
+                "g_copy_context_mode": g_ctx,
                 "has_event_target": picked is not None,
                 "event_kind": None if picked is None else picked.kind,
                 "geometry_loss": float(L_geom.detach()),

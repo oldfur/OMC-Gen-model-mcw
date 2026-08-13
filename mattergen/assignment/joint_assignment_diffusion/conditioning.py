@@ -185,6 +185,95 @@ class CopyContextPool(nn.Module):
         return v, c_i, v_a
 
 
+class OrbitSlotCopyContext(nn.Module):
+    """Copy × orbit slot table U[k,o] = pool_{i: copy=k, orbit=o} φ(h_i, z_o).
+
+    Shared φ across copies; no copy-ID embedding. Equivariant to copy-column perm.
+    """
+
+    def __init__(self, hidden: int):
+        super().__init__()
+        self.phi_slot = nn.Sequential(
+            nn.Linear(2 * hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+        )
+
+    def atom_slot_feat(
+        self, h: torch.Tensor, orbit_of: torch.Tensor, z_orbit: torch.Tensor
+    ) -> torch.Tensor:
+        o = orbit_of.long()
+        return self.phi_slot(torch.cat([h, z_orbit[o]], dim=-1))
+
+    def slot_table(
+        self,
+        h: torch.Tensor,
+        *,
+        orbit_of: torch.Tensor,
+        copy_of: torch.Tensor,
+        z_orbit: torch.Tensor,
+        K: int,
+        J: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return U[K,J,H], atom_feat[N,H], counts[K,J,1]."""
+        n, hid = h.shape
+        device, dtype = h.device, h.dtype
+        feat = self.atom_slot_feat(h, orbit_of, z_orbit)
+        U = torch.zeros(K, J, hid, device=device, dtype=dtype)
+        cnt = torch.zeros(K, J, 1, device=device, dtype=dtype)
+        if n == 0:
+            return U, feat, cnt
+        k = copy_of.long()
+        o = orbit_of.long()
+        flat = k * J + o
+        U.view(K * J, hid).index_add_(0, flat, feat)
+        ones = torch.ones(n, 1, device=device, dtype=dtype)
+        cnt.view(K * J, 1).index_add_(0, flat, ones)
+        U = U / cnt.clamp_min(1.0)
+        return U, feat, cnt
+
+    def exclude_atom_slots(
+        self,
+        U: torch.Tensor,
+        cnt: torch.Tensor,
+        feat: torch.Tensor,
+        orbit_of: torch.Tensor,
+        copy_of: torch.Tensor,
+    ) -> torch.Tensor:
+        """U_excl[i, o', :] = copy-of-i slot table with atom i removed from its own orbit."""
+        n = feat.shape[0]
+        k = copy_of.long()
+        o = orbit_of.long()
+        U_i = U[k]  # [N, J, H]
+        cnt_i = cnt[k]  # [N, J, 1]
+        ar = torch.arange(n, device=feat.device)
+        own = U_i[ar, o]
+        own_c = cnt_i[ar, o]
+        own_ex = (own * own_c - feat) / (own_c - 1.0).clamp_min(1.0)
+        own_ex = torch.where(own_c <= 1.0, torch.zeros_like(own_ex), own_ex)
+        U_ex = U_i.clone()
+        U_ex[ar, o] = own_ex
+        return U_ex
+
+    def slot_diagnostics(self, U: torch.Tensor) -> dict[str, float]:
+        """Norms and orbit-wise variance (collapse check)."""
+        if U.numel() == 0:
+            return {
+                "slot_embedding_norm_mean": 0.0,
+                "slot_embedding_norm_std": 0.0,
+                "slot_orbit_pairwise_var": 0.0,
+            }
+        norms = U.norm(dim=-1)
+        # variance of slot vectors across orbits, averaged over copies
+        # U: [K, J, H]
+        var_o = U.var(dim=1, unbiased=False).mean()
+        return {
+            "slot_embedding_norm_mean": float(norms.mean().detach()),
+            "slot_embedding_norm_std": float(norms.std(unbiased=False).detach()) if norms.numel() > 1 else 0.0,
+            "slot_orbit_pairwise_var": float(var_o.detach()),
+        }
+
+
 class SpatialEdgeAssignmentFeaturizer(nn.Module):
     """Scalar features for GemNet PBC edges from A (C, orbits, rho, clocks)."""
 

@@ -100,7 +100,10 @@ def main() -> None:
         strict=True,
     )
     schedule = AsyncJumpSchedule.from_config(cfg.get("schedule") or {})
-    model = JointAXLModel(bundle.denoiser.to(device), num_orbits=partition.J, schedule=schedule).to(device)
+    g_ctx = str(cfg.get("g_copy_context_mode") or "orbit_slot")
+    model = JointAXLModel(
+        bundle.denoiser.to(device), num_orbits=partition.J, schedule=schedule, g_copy_context_mode=g_ctx
+    ).to(device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["joint_state_dict"], strict=False)
     model.eval()

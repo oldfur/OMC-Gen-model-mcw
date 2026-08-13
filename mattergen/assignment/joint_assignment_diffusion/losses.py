@@ -230,6 +230,11 @@ def event_conditioned_assignment_ce(
         "num_legal": n_legal,
         "hit": hit,
         "chemgraph_scores": out.chemgraph_scores,
+        "g_copy_context_mode": out.diagnostics.get("g_copy_context_mode", "mean"),
+        "slot_embedding_norm_mean": out.diagnostics.get("slot_embedding_norm_mean", 0.0),
+        "slot_embedding_norm_std": out.diagnostics.get("slot_embedding_norm_std", 0.0),
+        "slot_pair_feature_norm": out.diagnostics.get("slot_pair_feature_norm", 0.0),
+        "slot_orbit_pairwise_var": out.diagnostics.get("slot_orbit_pairwise_var", 0.0),
     }
 
 
@@ -271,6 +276,11 @@ def event_conditioned_g_teacher_ce(
         "uniform_CE": pqual["uniform_CE_teacher"],
         "delta_CE": pqual["delta_CE_teacher"],
         "chemgraph_scores": out.chemgraph_scores,
+        "g_copy_context_mode": out.diagnostics.get("g_copy_context_mode", "mean"),
+        "slot_embedding_norm_mean": out.diagnostics.get("slot_embedding_norm_mean", 0.0),
+        "slot_embedding_norm_std": out.diagnostics.get("slot_embedding_norm_std", 0.0),
+        "slot_pair_feature_norm": out.diagnostics.get("slot_pair_feature_norm", 0.0),
+        "slot_orbit_pairwise_var": out.diagnostics.get("slot_orbit_pairwise_var", 0.0),
         **tdiag,
         **pqual,
     }

@@ -16,6 +16,7 @@ from .conditioning import (
     CopyContextPool,
     OrbitRelationTable,
     OrbitSiteEncoder,
+    OrbitSlotCopyContext,
     SpatialEdgeAssignmentFeaturizer,
 )
 from .jump_heads import (
@@ -51,11 +52,13 @@ class JointAXLModel(nn.Module):
         num_orbits: int,
         hidden: int | None = None,
         schedule: AsyncJumpSchedule | None = None,
+        g_copy_context_mode: str = "mean",
     ):
         super().__init__()
         self.denoiser = denoiser
         self.hidden = int(hidden or getattr(denoiser, "hidden_dim", 512))
         self.schedule = schedule or AsyncJumpSchedule()
+        self.g_copy_context_mode = str(g_copy_context_mode or "mean")
         self.orbit_encoder = OrbitSiteEncoder(hidden=self.hidden)
         self.orbit_to_node = nn.Sequential(
             nn.Linear(self.hidden, self.hidden),
@@ -78,8 +81,9 @@ class JointAXLModel(nn.Module):
         self.spatial_edge = SpatialEdgeAssignmentFeaturizer(hidden=emb_edge, rho_dim=32, clock_dim=64)
         self.assign_mp = AssignmentGraphMP(hidden=self.hidden, edge_dim=32)
         self.copy_pool = CopyContextPool(hidden=self.hidden)
+        self.orbit_slot_ctx = OrbitSlotCopyContext(hidden=self.hidden)
         self.r_head = RJumpHead(hidden=self.hidden, rho_dim=32)
-        self.g_head = GJumpHead(hidden=self.hidden)
+        self.g_head = GJumpHead(hidden=self.hidden, copy_context_mode=self.g_copy_context_mode)
         self.copy_to_node = nn.Linear(self.hidden, self.hidden)
         nn.init.zeros_(self.copy_to_node.weight)
         nn.init.zeros_(self.copy_to_node.bias)
@@ -94,6 +98,7 @@ class JointAXLModel(nn.Module):
             self.spatial_edge,
             self.assign_mp,
             self.copy_pool,
+            self.orbit_slot_ctx,
             self.r_head,
             self.g_head,
             self.copy_to_node,
@@ -259,7 +264,7 @@ class JointAXLModel(nn.Module):
         if compute_jumps:
             v, c_i, v_a = self.copy_pool(h, orbit_of, copy_of, z_orbit, state.K)
             moves = enumerate_legal_moves(state)
-            scored = compute_move_logits(
+            scored, slot_diag = compute_move_logits(
                 moves=moves,
                 h=h,
                 state=state,
@@ -269,7 +274,10 @@ class JointAXLModel(nn.Module):
                 rho_table=self.rho,
                 r_head=self.r_head,
                 g_head=self.g_head,
+                slot_ctx=self.orbit_slot_ctx if self.g_copy_context_mode == "orbit_slot" else None,
+                t_scalar=t_scalar,
             )
+            jump_diag.update(slot_diag)
             move_logits = scored
             # J1.1: r_m = β(t) · softmax(ℓ)_m  (fixed total exit rate)
             move_pi = logits_to_pi(scored)
@@ -278,8 +286,8 @@ class JointAXLModel(nn.Module):
                 beta_r=meta["beta_r"],
                 beta_g=meta["beta_g"],
             )
-            jump_diag = jump_pool_diagnostics(
-                scored, beta_r=meta["beta_r"], beta_g=meta["beta_g"]
+            jump_diag.update(
+                jump_pool_diagnostics(scored, beta_r=meta["beta_r"], beta_g=meta["beta_g"])
             )
         return JointModelOutput(
             chemgraph_scores=scores,

@@ -84,10 +84,17 @@ class RJumpHead(nn.Module):
 
 
 class GJumpHead(nn.Module):
-    """Symmetric pair head for legal G-moves with exclusion copy contexts."""
+    """Symmetric pair head for legal G-moves.
 
-    def __init__(self, hidden: int):
+    ``mean``: exclusion mean copy context (J1.3-A baseline).
+    ``orbit_slot``: structured U[k,o] slots with remove-one exclusion (J1.3-B1).
+    """
+
+    def __init__(self, hidden: int, *, copy_context_mode: str = "mean"):
         super().__init__()
+        if copy_context_mode not in ("mean", "orbit_slot"):
+            raise ValueError(f"unknown g copy_context_mode={copy_context_mode}")
+        self.copy_context_mode = copy_context_mode
         in_dim = 2 * hidden + 2 * hidden + 2 * hidden
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
@@ -98,6 +105,21 @@ class GJumpHead(nn.Module):
         )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+        # Orbit-slot pair MLP: local pair + slot pair + z_o + z_o' + t
+        self.t_enc = nn.Sequential(nn.Linear(1, 32), nn.SiLU(), nn.Linear(32, 32))
+        slot_in = 2 * hidden + 2 * hidden + 2 * hidden + 32
+        self.slot_pair = nn.Sequential(
+            nn.Linear(slot_in, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.slot_out = nn.Sequential(
+            nn.Linear(2 * hidden + 2 * hidden + hidden + 32, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+        nn.init.zeros_(self.slot_out[-1].weight)
+        nn.init.zeros_(self.slot_out[-1].bias)
 
     def pair_logit(
         self,
@@ -149,6 +171,45 @@ class GJumpHead(nn.Module):
         )
         return self.net(feat).squeeze(-1)
 
+    def batch_logits_orbit_slot(
+        self,
+        h: torch.Tensor,
+        ii: torch.Tensor,
+        jj: torch.Tensor,
+        *,
+        z_orbit: torch.Tensor,
+        orbit_of: torch.Tensor,
+        u_excl: torch.Tensor,
+        t_scalar: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Orbit-slot G logits. u_excl[n, J, H] is per-atom exclusion slot table.
+
+        Returns (logits[P], q_slot[P, H]) for diagnostics.
+        """
+        hi, hj = h[ii], h[jj]
+        oi = orbit_of[ii].long()
+        uk, ul = u_excl[ii], u_excl[jj]  # [P, J, H]
+        p, j_orb, hid = uk.shape
+        tenc = self.t_enc(
+            torch.tensor([[float(t_scalar)]], device=h.device, dtype=h.dtype)
+        ).expand(p, j_orb, -1)
+        zo_c = z_orbit[oi].unsqueeze(1).expand(p, j_orb, -1)
+        zo_s = z_orbit.unsqueeze(0).expand(p, j_orb, -1)
+        hi_e = (hi + hj).unsqueeze(1).expand(p, j_orb, -1)
+        hd_e = (hi - hj).abs().unsqueeze(1).expand(p, j_orb, -1)
+        slot_in = torch.cat(
+            [hi_e, hd_e, uk + ul, (uk - ul).abs(), zo_c, zo_s, tenc],
+            dim=-1,
+        )
+        q_o = self.slot_pair(slot_in)  # [P, J, H]
+        q_pool = q_o.mean(dim=1)
+        t_pair = self.t_enc(
+            torch.tensor([[float(t_scalar)]], device=h.device, dtype=h.dtype)
+        ).expand(p, -1)
+        local = torch.cat([hi + hj, (hi - hj).abs(), z_orbit[oi], z_orbit[orbit_of[jj].long()]], dim=-1)
+        logits = self.slot_out(torch.cat([local, q_pool, t_pair], dim=-1)).squeeze(-1)
+        return logits, q_pool
+
 
 def _exclusion_contexts(
     h: torch.Tensor,
@@ -185,11 +246,17 @@ def compute_move_logits(
     rho_table,
     r_head: RJumpHead,
     g_head: GJumpHead,
-) -> dict[str, list[tuple[LegalMove, torch.Tensor]]]:
-    """Score all legal moves; batched MLP forwards."""
+    slot_ctx=None,
+    t_scalar: float = 0.0,
+) -> tuple[dict[str, list[tuple[LegalMove, torch.Tensor]]], dict]:
+    """Score all legal moves; batched MLP forwards.
+
+    Returns (scored, slot_diag). slot_diag is empty in mean mode.
+    """
     orbit_of = state.orbit_of()
     copy_of = state.copy_of()
     out: dict[str, list[tuple[LegalMove, torch.Tensor]]] = {"R": [], "G": []}
+    slot_diag: dict = {"g_copy_context_mode": getattr(g_head, "copy_context_mode", "mean")}
     device = h.device
 
     r_moves = moves["R"]
@@ -209,13 +276,30 @@ def compute_move_logits(
     if g_moves:
         ii = torch.tensor([m.i for m in g_moves], device=device, dtype=torch.long)
         jj = torch.tensor([m.j for m in g_moves], device=device, dtype=torch.long)
-        excl = _exclusion_contexts(h, copy_of, v_copies)
-        logits = g_head.batch_logits(
-            h, ii, jj, z_orbit=z_orbit, orbit_of=orbit_of, excl=excl
-        )
+        mode = getattr(g_head, "copy_context_mode", "mean")
+        if mode == "orbit_slot" and slot_ctx is not None:
+            U, feat, cnt = slot_ctx.slot_table(
+                h,
+                orbit_of=orbit_of,
+                copy_of=copy_of,
+                z_orbit=z_orbit,
+                K=state.K,
+                J=state.J,
+            )
+            u_excl = slot_ctx.exclude_atom_slots(U, cnt, feat, orbit_of, copy_of)
+            logits, q_pool = g_head.batch_logits_orbit_slot(
+                h, ii, jj, z_orbit=z_orbit, orbit_of=orbit_of, u_excl=u_excl, t_scalar=t_scalar
+            )
+            slot_diag.update(slot_ctx.slot_diagnostics(U))
+            slot_diag["slot_pair_feature_norm"] = float(q_pool.norm(dim=-1).mean().detach())
+        else:
+            excl = _exclusion_contexts(h, copy_of, v_copies)
+            logits = g_head.batch_logits(
+                h, ii, jj, z_orbit=z_orbit, orbit_of=orbit_of, excl=excl
+            )
         for m, logit in zip(g_moves, logits):
             out["G"].append((m, logit))
-    return out
+    return out, slot_diag
 
 
 def logits_to_pi(

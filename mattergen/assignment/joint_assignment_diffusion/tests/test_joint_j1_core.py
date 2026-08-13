@@ -120,6 +120,62 @@ def test_forward_ctmc_produces_g_and_r_events():
     assert n_R > 0, "R events must not systematically vanish"
 
 
+def test_orbit_slot_copy_perm_equivariance():
+    """U and G logits follow copy-column permutation; no copy-id features."""
+    import torch.nn as nn
+
+    from mattergen.assignment.joint_assignment_diffusion.conditioning import OrbitSlotCopyContext
+    from mattergen.assignment.joint_assignment_diffusion.jump_heads import GJumpHead
+
+    torch.manual_seed(0)
+    n, h, k, j = 6, 8, 2, 3
+    orbit_of = torch.tensor([0, 1, 2, 0, 1, 2])
+    copy_of = torch.tensor([0, 0, 0, 1, 1, 1])
+    hid = torch.randn(n, h)
+    z_orbit = torch.randn(j, h)
+    ctx = OrbitSlotCopyContext(h)
+    U, feat, cnt = ctx.slot_table(
+        hid, orbit_of=orbit_of, copy_of=copy_of, z_orbit=z_orbit, K=k, J=j
+    )
+    perm = torch.tensor([1, 0])
+    copy2 = perm[copy_of]
+    U2, _, _ = ctx.slot_table(
+        hid, orbit_of=orbit_of, copy_of=copy2, z_orbit=z_orbit, K=k, J=j
+    )
+    assert torch.allclose(U2[1], U[0], atol=1e-5)
+    assert torch.allclose(U2[0], U[1], atol=1e-5)
+    head = GJumpHead(h, copy_context_mode="orbit_slot")
+    for p in head.parameters():
+        if p.dim() >= 2:
+            torch.nn.init.xavier_uniform_(p)
+        else:
+            torch.nn.init.zeros_(p)
+    nn.init.zeros_(head.slot_out[-1].weight)
+    nn.init.zeros_(head.slot_out[-1].bias)
+    # after last-layer zero, logits are 0 (uniform start) regardless of perm
+    u_ex = ctx.exclude_atom_slots(U, cnt, feat, orbit_of, copy_of)
+    ii = torch.tensor([0, 1, 2])
+    jj = torch.tensor([3, 4, 5])
+    logits, _ = head.batch_logits_orbit_slot(
+        hid, ii, jj, z_orbit=z_orbit, orbit_of=orbit_of, u_excl=u_ex, t_scalar=0.5
+    )
+    assert torch.allclose(logits, torch.zeros_like(logits), atol=1e-6)
+    # nonzero last layer: logits invariant to copy relabel
+    torch.nn.init.xavier_uniform_(head.slot_out[-1].weight)
+    logits_a, _ = head.batch_logits_orbit_slot(
+        hid, ii, jj, z_orbit=z_orbit, orbit_of=orbit_of, u_excl=u_ex, t_scalar=0.5
+    )
+    feat2 = ctx.atom_slot_feat(hid, orbit_of, z_orbit)
+    U2, feat2, cnt2 = ctx.slot_table(
+        hid, orbit_of=orbit_of, copy_of=copy2, z_orbit=z_orbit, K=k, J=j
+    )
+    u_ex2 = ctx.exclude_atom_slots(U2, cnt2, feat2, orbit_of, copy2)
+    logits_b, _ = head.batch_logits_orbit_slot(
+        hid, ii, jj, z_orbit=z_orbit, orbit_of=orbit_of, u_excl=u_ex2, t_scalar=0.5
+    )
+    assert torch.allclose(logits_a, logits_b, atol=1e-5)
+
+
 def test_g_teacher_support_only_beneficial_and_fallback():
     from mattergen.assignment.joint_assignment_diffusion.g_teacher import improvement_weighted_teacher
 
