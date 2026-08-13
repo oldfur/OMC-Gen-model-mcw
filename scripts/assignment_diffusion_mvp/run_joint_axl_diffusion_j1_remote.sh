@@ -53,4 +53,4 @@ python scripts/assignment_diffusion_mvp/sample_joint_axl_diffusion_j1.py \
   --assignment-mode all \
   --execute
 
-echo "DONE J1.1 → $OUT"
+echo "DONE J1.2 → $OUT"

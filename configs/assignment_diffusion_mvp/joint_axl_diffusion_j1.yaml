@@ -39,3 +39,5 @@ joint_j1:
     # sampling controls: ctmc_A (default) and static_A (A fixed at prior)
     assignment_modes: [ctmc_A, static_A]
     num_samples_per_mode: 4
+    reverse_eval:
+      seeds: [101, 102, 103, 104, 105, 106, 107, 108]

@@ -120,6 +120,15 @@ def test_forward_ctmc_produces_g_and_r_events():
     assert n_R > 0, "R events must not systematically vanish"
 
 
+def test_event_bin_labels_cover_g_window():
+    from mattergen.assignment.joint_assignment_diffusion.reverse_eval import event_bin_name
+
+    assert event_bin_name("G", 0.37) == "[0.35,0.40)"
+    assert event_bin_name("G", 0.52) == "[0.50,0.55)"
+    assert event_bin_name("G", 0.70) == "[0.65,0.75]"
+    assert event_bin_name("R", 0.81) == "[0.80,0.85)"
+
+
 def test_next_reverse_grid_s_matches_sampler_macrostep():
     from mattergen.assignment.joint_assignment_diffusion.schedule import next_reverse_grid_s
 

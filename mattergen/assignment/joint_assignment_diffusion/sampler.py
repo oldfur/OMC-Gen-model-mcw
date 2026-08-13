@@ -29,6 +29,19 @@ def _rand(generator: torch.Generator | None) -> float:
     return float(torch.rand((), generator=generator).item())
 
 
+def _uniformize_pi(pi: dict) -> dict:
+    """Replace learned π with uniform 1/|M| on each legal pool (fixed β still applies)."""
+    out = {"R": [], "G": []}
+    for kind in ("R", "G"):
+        pool = pi.get(kind) or []
+        n = len(pool)
+        if n == 0:
+            continue
+        u = 1.0 / float(n)
+        out[kind] = [(m, p * 0.0 + u) for m, p in pool]
+    return out
+
+
 def _gillespie_step_a_integrated(
     model,
     chemgraph,
@@ -39,6 +52,7 @@ def _gillespie_step_a_integrated(
     generator: torch.Generator | None = None,
     max_events: int = 10_000,
     static_A: bool = False,
+    policy: str = "learned",
 ) -> tuple[JointAssignmentState, list[CTMCEvent], dict[str, Any]]:
     """Reverse A dynamics on (t_target, t] with non-homogeneous integrated hazard.
 
@@ -90,6 +104,8 @@ def _gillespie_step_a_integrated(
         t_ten = torch.tensor([cur_t], device=chemgraph["pos"].device, dtype=torch.float32)
         out = model(chemgraph, t_ten, st, compute_jumps=True)
         pi = logits_to_pi(out.move_logits)
+        if policy == "uniform":
+            pi = _uniformize_pi(pi)
         mass_r = beta_r if pi["R"] else 0.0
         mass_g = beta_g if pi["G"] else 0.0
         tot = mass_r + mass_g
@@ -151,7 +167,7 @@ def a_first_lie_step(
     """One macrostep t→s: A-step (integrated hazard) then geometry-step."""
     cg_t = chemgraph_builder(sample_tensors, frac_t, cell_t)
     state_s, events, a_diag = _gillespie_step_a_integrated(
-        model, cg_t, t, s, state, generator=generator, static_A=static_A
+        model, cg_t, t, s, state, generator=generator, static_A=static_A, policy="learned"
     )
     cg_s_cond = chemgraph_builder(sample_tensors, frac_t, cell_t)
     t_ten = torch.tensor([t], device=frac_t.device, dtype=torch.float32)

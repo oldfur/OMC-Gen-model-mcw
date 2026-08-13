@@ -86,6 +86,24 @@ def jump_budget_diagnostics(
     }
 
 
+def assignment_distances(pred: JointAssignmentState, target: JointAssignmentState) -> dict[str, float]:
+    """Scalar distances used by reverse-eval Δd (lower is closer to target)."""
+    m = assignment_vs_target(pred, target)
+    orbit_acc = float(m["orbit_atom_accuracy"])
+    ari = float(m["ARI"])
+    f1 = float(m["copy_pair_f1"])
+    return {
+        "d_orbit": 1.0 - orbit_acc,
+        "d_ari": 1.0 - ari,
+        "d_f1": 1.0 - f1,
+        "orbit_atom_accuracy": orbit_acc,
+        "orbit_exact": 1.0 if orbit_acc >= 1.0 - 1e-12 else 0.0,
+        "ARI": ari,
+        "copy_pair_f1": f1,
+        "exact_C": 1.0 if bool(m["exact_C"]) else 0.0,
+    }
+
+
 def assignment_vs_target(state: JointAssignmentState, target: JointAssignmentState) -> dict[str, float | bool]:
     C = state.C()
     C0 = target.C()

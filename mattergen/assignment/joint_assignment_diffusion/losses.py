@@ -151,6 +151,110 @@ def reverse_categorical_jump_nll(
     }
 
 
+def event_conditioned_assignment_ce(
+    *,
+    model,
+    chemgraph_t,
+    t: torch.Tensor,
+    state_after: JointAssignmentState,
+    kind: str,
+    i: int,
+    j: int,
+    clip: float = 8.0,
+) -> dict[str, torch.Tensor | float | int]:
+    """Single reverse-event CE at global time τ: input (X_τ, L_τ, A_{τ+}).
+
+    Target is the inverse swap m^{-1}=(i,j) (same pair as the forward event).
+    L = -log π_a(m^{-1}); rates remain r=βπ (unused in this CE).
+    """
+    t = torch.as_tensor(t, dtype=torch.float32, device=chemgraph_t["pos"].device).reshape(-1)
+    out = model(chemgraph_t, t, state_after, compute_jumps=True)
+    scored = out.move_logits
+    # scores cached on output for optional same-τ geometry loss (single GemNet)
+    pi_pool = logits_to_pi(scored, clip=clip).get(kind, [])
+    n_legal = len(pi_pool)
+    device = t.device
+    zero = torch.zeros((), device=device)
+    if n_legal == 0:
+        return {
+            "CE": zero + 20.0,
+            "uniform_CE": 0.0,
+            "delta_CE": 20.0,
+            "target_probability": 0.0,
+            "target_rank": -1,
+            "top1": 0.0,
+            "top5": 0.0,
+            "entropy": 0.0,
+            "num_legal": 0,
+            "hit": 0,
+        }
+    key = _pair_key(i, j)
+    probs = []
+    target_p = None
+    target_idx = None
+    for idx, (m, p) in enumerate(pi_pool):
+        probs.append(p)
+        if _pair_key(m.i, m.j) == key:
+            target_p = p
+            target_idx = idx
+    stacked = torch.stack(probs)
+    order = torch.argsort(stacked, descending=True)
+    if target_p is None:
+        ce = zero + 20.0
+        tprob = 0.0
+        rank = n_legal + 1
+        hit = 0
+    else:
+        ce = -torch.log(target_p.clamp_min(1e-12))
+        tprob = float(target_p.detach())
+        rank = int((order == target_idx).nonzero(as_tuple=True)[0].item()) + 1
+        hit = 1
+    uni = float(math.log(n_legal))
+    ent = float((-(stacked.detach() * stacked.detach().clamp_min(1e-12).log()).sum()))
+    return {
+        "CE": ce,
+        "uniform_CE": uni,
+        "delta_CE": float(ce.detach()) - uni,
+        "target_probability": tprob,
+        "target_rank": rank,
+        "top1": 1.0 if rank == 1 else 0.0,
+        "top5": 1.0 if 1 <= rank <= 5 else 0.0,
+        "entropy": ent,
+        "num_legal": n_legal,
+        "hit": hit,
+        "chemgraph_scores": out.chemgraph_scores,
+    }
+
+
+def geometry_step_loss(
+    *,
+    model,
+    loss_fn,
+    corruption,
+    clean_cg,
+    noisy_cg,
+    t: torch.Tensor,
+    state_at_t: JointAssignmentState,
+) -> dict[str, torch.Tensor]:
+    """MatterGen geometry loss at a single global t with A_t."""
+    t = torch.as_tensor(t, dtype=torch.float32).reshape(-1)
+    if noisy_cg["pos"].device.type != "cpu":
+        t = t.to(device=noisy_cg["pos"].device)
+    geom_out = model(noisy_cg, t, state_at_t, compute_jumps=False)
+    L_geom, metrics = mattergen_geometry_loss(
+        loss_fn=loss_fn,
+        corruption=corruption,
+        clean_batch=clean_cg,
+        noisy_batch=noisy_cg,
+        score_model_output=geom_out.chemgraph_scores,
+        t=t,
+    )
+    out: dict[str, torch.Tensor] = {"L_geom": L_geom, "loss": L_geom}
+    for k, v in metrics.items():
+        out[f"geom_{k}"] = torch.tensor(v, device=L_geom.device) if not torch.is_tensor(v) else v
+    return out
+
+
 def joint_training_step_losses(
     *,
     model,

@@ -18,11 +18,13 @@ if str(ROOT) not in sys.path:
 from mattergen.assignment.global_copy_assembly.orbit_membership import build_orbit_partition
 from mattergen.assignment.joint_assignment_diffusion.ctmc import simulate_forward_ctmc
 from mattergen.assignment.joint_assignment_diffusion.joint_model import JointAXLModel
-from mattergen.assignment.joint_assignment_diffusion.losses import joint_training_step_losses
-from mattergen.assignment.joint_assignment_diffusion.schedule import (
-    AsyncJumpSchedule,
-    next_reverse_grid_s,
+from mattergen.assignment.joint_assignment_diffusion.losses import (
+    event_conditioned_assignment_ce,
+    geometry_step_loss,
 )
+from mattergen.assignment.soft_c_geometry_feedback_n2.geometry_loss import mattergen_geometry_loss
+from mattergen.assignment.joint_assignment_diffusion.reverse_eval import aggregate_event_bins, event_bin_name
+from mattergen.assignment.joint_assignment_diffusion.schedule import AsyncJumpSchedule
 from mattergen.assignment.joint_assignment_diffusion.state import a_from_role_and_copy
 from mattergen.assignment.joint_assignment_diffusion.symmetry import (
     apply_symmetry_to_geometry,
@@ -172,8 +174,9 @@ def main() -> None:
     prov = {
         "J1_MODE": "joint_axl_ctmc_j1_1",
         "RATE_MODEL": "fixed_exit_beta_softmax",
-        "ASSIGNMENT_LOSS": "reverse_categorical_nll_event_mean",
-        "JOINT_TIME": "single_global_t",
+        "ASSIGNMENT_LOSS": "event_conditioned_reverse_ce",
+        "JOINT_TIME": "single_global_tau_or_t",
+        "J1_2": "event_conditioned_assignment",
         "R_WINDOW": list(schedule.r_window),
         "G_WINDOW": list(schedule.g_window),
         "KAPPA_R": schedule.kappa_r,
@@ -199,6 +202,7 @@ def main() -> None:
         K=int(sample_d["Z"]),
     )
 
+    event_records: list[dict] = []
     with (out / "training_trace.jsonl").open("w", buffering=1) as stream:
         for step in range(steps):
             # symmetry augmentation
@@ -215,31 +219,43 @@ def main() -> None:
             )
             # forward CTMC on A (uniform π prior, fixed exit β_R/β_G)
             traj = simulate_forward_ctmc(st0, schedule=schedule, t_start=0.0, t_end=1.0, generator=g)
+            n_R_all = sum(1 for e in traj.events if e.kind == "R")
+            n_G_all = sum(1 for e in traj.events if e.kind == "G")
 
-            # ---- single global time t (joint state S_t = (A_t, X_t, L_t)) ----
-            # Optional focus sampling still yields ONE t, not independent t_R/t_G/t_X.
+            # Focus: R/G sample a real forward event; U is geometry-only t~U(0,1)
             focus_u = float(torch.rand((), generator=g).item())
             if focus_u < 0.34:
                 t_focus = "R"
-                t_f = schedule.sample_t_proportional_to_beta(kind="R", generator=g)
             elif focus_u < 0.68:
                 t_focus = "G"
-                t_f = schedule.sample_t_proportional_to_beta(kind="G", generator=g)
+            else:
+                t_focus = "U"
+
+            picked = None
+            if t_focus in ("R", "G"):
+                pool = [e for e in traj.events if e.kind == t_focus]
+                # Retry a few trajectories so R/G-focus almost always has a target
+                retries = 0
+                while not pool and retries < 4:
+                    traj = simulate_forward_ctmc(st0, schedule=schedule, t_start=0.0, t_end=1.0, generator=g)
+                    pool = [e for e in traj.events if e.kind == t_focus]
+                    n_R_all = sum(1 for e in traj.events if e.kind == "R")
+                    n_G_all = sum(1 for e in traj.events if e.kind == "G")
+                    retries += 1
+                if pool:
+                    idx = int(torch.randint(0, len(pool), (), generator=g).item())
+                    picked = pool[idx]
+
+            if picked is not None:
+                t_f = float(picked.time)
+                state_t = traj.state_at(t_f)  # A_{τ+}
             else:
                 t_focus = "U"
                 t_ten = noise.sample_t(1, device=device)
                 t_f = float(t_ten.reshape(-1)[0].item())
-            t = torch.tensor([t_f], device=device, dtype=torch.float32)
-            # Reverse endpoint aligned with A-first Lie sampler grid (not s~U(0,t))
-            eval_grid = (cfg.get("evaluation") or {}).get("timesteps") or None
-            t_s = next_reverse_grid_s(t_f, eval_grid)
-            state_t = traj.state_at(t_f)
-            state_s = traj.state_at(t_s)
-            H_R_to_t = schedule.integrated_beta(0.0, t_f, kind="R")
-            H_G_to_t = schedule.integrated_beta(0.0, t_f, kind="G")
-            H_R_seg = schedule.integrated_beta(t_s, t_f, kind="R")
-            H_G_seg = schedule.integrated_beta(t_s, t_f, kind="G")
+                state_t = traj.state_at(t_f)
 
+            t = torch.tensor([t_f], device=device, dtype=torch.float32)
             noisy = noise.corrupt_fixed_sample(
                 frac_coords_0=geo["pos"],
                 lattice_0=sample_d["cell"],
@@ -268,73 +284,103 @@ def main() -> None:
             noisy_cg = build_cg(samp_aug, noisy.frac_coords_t, noisy.lattice_t, extra_mol=mol_extra)
 
             opt.zero_grad(set_to_none=True)
-            losses = joint_training_step_losses(
-                model=model,
-                loss_fn=loss_fn,
-                corruption=noise.corruption,
-                clean_cg=clean_cg,
-                noisy_cg=noisy_cg,
-                t=noisy.t,
-                t_s=t_s,
-                state_at_t=state_t,
-                traj=traj,
-                lambda_r=float(loss_w.get("lambda_r", 1.0)),
-                lambda_g=float(loss_w.get("lambda_g", 1.0)),
-                h_r_segment=H_R_seg,
-                h_g_segment=H_G_seg,
-            )
-            losses["loss"].backward()
+            lam_r = float(loss_w.get("lambda_r", 1.0))
+            lam_g = float(loss_w.get("lambda_g", 1.0))
+            ce_r = torch.zeros((), device=device)
+            ce_g = torch.zeros((), device=device)
+            ev_diag: dict = {}
+            if picked is not None:
+                ev_diag = event_conditioned_assignment_ce(
+                    model=model,
+                    chemgraph_t=noisy_cg,
+                    t=noisy.t,
+                    state_after=state_t,
+                    kind=picked.kind,
+                    i=picked.i,
+                    j=picked.j,
+                )
+                L_geom, _gmet = mattergen_geometry_loss(
+                    loss_fn=loss_fn,
+                    corruption=noise.corruption,
+                    clean_batch=clean_cg,
+                    noisy_batch=noisy_cg,
+                    score_model_output=ev_diag["chemgraph_scores"],
+                    t=torch.as_tensor(noisy.t, dtype=torch.float32, device=device).reshape(-1),
+                )
+                if picked.kind == "R":
+                    ce_r = ev_diag["CE"]
+                else:
+                    ce_g = ev_diag["CE"]
+                event_records.append(
+                    {
+                        "step": step,
+                        "kind": picked.kind,
+                        "tau": t_f,
+                        "bin": event_bin_name(picked.kind, t_f),
+                        "CE": float(ev_diag["CE"].detach()),
+                        "uniform_CE": float(ev_diag["uniform_CE"]),
+                        "delta_CE": float(ev_diag["delta_CE"]),
+                        "target_probability": float(ev_diag["target_probability"]),
+                        "target_rank": int(ev_diag["target_rank"]),
+                        "top1": float(ev_diag["top1"]),
+                        "top5": float(ev_diag["top5"]),
+                        "entropy": float(ev_diag["entropy"]),
+                        "num_legal": int(ev_diag["num_legal"]),
+                    }
+                )
+            else:
+                geom = geometry_step_loss(
+                    model=model,
+                    loss_fn=loss_fn,
+                    corruption=noise.corruption,
+                    clean_cg=clean_cg,
+                    noisy_cg=noisy_cg,
+                    t=noisy.t,
+                    state_at_t=state_t,
+                )
+                L_geom = geom["L_geom"]
+            total = L_geom + lam_r * ce_r + lam_g * ce_g
+            total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
             opt.step()
-            n_R_all = sum(1 for e in traj.events if e.kind == "R")
-            n_G_all = sum(1 for e in traj.events if e.kind == "G")
-            n_R_seg = sum(1 for e in traj.events_on_segment(t_s, t_f) if e.kind == "R")
-            n_G_seg = sum(1 for e in traj.events_on_segment(t_s, t_f) if e.kind == "G")
-            H_R_full = schedule.integrated_beta(0.0, 1.0, kind="R")
-            H_G_full = schedule.integrated_beta(0.0, 1.0, kind="G")
+
             row = {
                 "step": step,
                 "global_t": t_f,
-                "global_s": t_s,
                 "t_focus": t_focus,
-                "geometry_loss": float(losses["L_geom"].detach()),
-                "CE_R": float(losses["CE_R"].detach()),
-                "CE_G": float(losses["CE_G"].detach()),
-                "L_R": float(losses["L_R"].detach()),
-                "L_G": float(losses["L_G"].detach()),
-                "uniform_CE_R": float(losses["uniform_CE_R"].detach()),
-                "uniform_CE_G": float(losses["uniform_CE_G"].detach()),
-                "delta_CE_R": float(losses["delta_CE_R"].detach()),
-                "delta_CE_G": float(losses["delta_CE_G"].detach()),
-                "total_loss": float(losses["loss"].detach()),
+                "has_event_target": picked is not None,
+                "event_kind": None if picked is None else picked.kind,
+                "geometry_loss": float(L_geom.detach()),
+                "CE_R": float(ce_r.detach()),
+                "CE_G": float(ce_g.detach()),
+                "L_R": float(ce_r.detach()),
+                "L_G": float(ce_g.detach()),
+                "uniform_CE_R": float(ev_diag.get("uniform_CE", 0.0)) if picked is not None and picked.kind == "R" else 0.0,
+                "uniform_CE_G": float(ev_diag.get("uniform_CE", 0.0)) if picked is not None and picked.kind == "G" else 0.0,
+                "delta_CE_R": float(ev_diag.get("delta_CE", 0.0)) if picked is not None and picked.kind == "R" else 0.0,
+                "delta_CE_G": float(ev_diag.get("delta_CE", 0.0)) if picked is not None and picked.kind == "G" else 0.0,
+                "target_probability": float(ev_diag.get("target_probability", 0.0)) if ev_diag else 0.0,
+                "target_rank": int(ev_diag.get("target_rank", -1)) if ev_diag else -1,
+                "top1": float(ev_diag.get("top1", 0.0)) if ev_diag else 0.0,
+                "top5": float(ev_diag.get("top5", 0.0)) if ev_diag else 0.0,
+                "entropy": float(ev_diag.get("entropy", 0.0)) if ev_diag else 0.0,
+                "num_legal": int(ev_diag.get("num_legal", 0)) if ev_diag else 0,
+                "total_loss": float(total.detach()),
                 "num_fwd_events": len(traj.events),
                 "n_R_fwd": n_R_all,
                 "n_G_fwd": n_G_all,
-                "n_R_events": float(losses["n_R_events"].detach()),
-                "n_G_events": float(losses["n_G_events"].detach()),
-                "n_R_events_segment": n_R_seg,
-                "n_G_events_segment": n_G_seg,
-                "num_legal_R": float(losses["num_legal_R"].detach()),
-                "num_legal_G": float(losses["num_legal_G"].detach()),
-                "H_R_full": H_R_full,
-                "H_G_full": H_G_full,
-                "H_R_segment": H_R_seg,
-                "H_G_segment": H_G_seg,
-                "expected_R_segment": H_R_seg,
-                "expected_G_segment": H_G_seg,
-                "H_R_to_t": H_R_to_t,
-                "H_G_to_t": H_G_to_t,
                 "beta_R_t": float(schedule.beta_r(t_f).item()),
                 "beta_G_t": float(schedule.beta_g(t_f).item()),
                 "state_t_legal": state_t.validate()["legal"],
-                "state_s_legal": state_s.validate()["legal"],
             }
-            for k in ("entropy_R", "entropy_G", "logit_mean_R", "logit_mean_G"):
-                if k in losses:
-                    row[k] = float(losses[k].detach())
             stream.write(json.dumps(row) + "\n")
             if step % log_every == 0 or step + 1 == steps:
                 print(json.dumps(row), flush=True)
+
+    (out / "event_bin_summary.json").write_text(json.dumps(aggregate_event_bins(event_records), indent=2))
+    with (out / "event_bin_trace.jsonl").open("w") as ef:
+        for rec in event_records:
+            ef.write(json.dumps(rec) + "\n")
 
     torch.save(
         {
@@ -349,7 +395,7 @@ def main() -> None:
         {"joint_state_dict": model.state_dict(), "provenance": prov},
         out / "best_checkpoint.pt",
     )
-    print(json.dumps({"event": "j1_train_done", "output": str(out)}), flush=True)
+    print(json.dumps({"event": "j1_train_done", "output": str(out), "n_event_targets": len(event_records)}), flush=True)
 
 
 if __name__ == "__main__":
