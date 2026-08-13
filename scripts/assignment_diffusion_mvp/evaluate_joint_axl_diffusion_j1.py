@@ -77,7 +77,7 @@ def main() -> None:
         strict=True,
     )
     schedule = AsyncJumpSchedule.from_config(cfg.get("schedule") or {})
-    g_ctx = str(cfg.get("g_copy_context_mode") or "orbit_slot")
+    g_ctx = str(cfg.get("g_copy_context_mode") or "orbit_slot_geometry")
     model = JointAXLModel(
         bundle.denoiser.to(device), num_orbits=partition.J, schedule=schedule, g_copy_context_mode=g_ctx
     ).to(device)

@@ -264,6 +264,8 @@ class JointAXLModel(nn.Module):
         if compute_jumps:
             v, c_i, v_a = self.copy_pool(h, orbit_of, copy_of, z_orbit, state.K)
             moves = enumerate_legal_moves(state)
+            use_slots = self.g_copy_context_mode in ("orbit_slot", "orbit_slot_geometry")
+            use_geom = self.g_copy_context_mode == "orbit_slot_geometry"
             scored, slot_diag = compute_move_logits(
                 moves=moves,
                 h=h,
@@ -274,8 +276,10 @@ class JointAXLModel(nn.Module):
                 rho_table=self.rho,
                 r_head=self.r_head,
                 g_head=self.g_head,
-                slot_ctx=self.orbit_slot_ctx if self.g_copy_context_mode == "orbit_slot" else None,
+                slot_ctx=self.orbit_slot_ctx if use_slots else None,
                 t_scalar=t_scalar,
+                frac=chemgraph["pos"] if use_geom else None,
+                cell=chemgraph["cell"] if use_geom else None,
             )
             jump_diag.update(slot_diag)
             move_logits = scored

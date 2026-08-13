@@ -7,8 +7,11 @@ from typing import Any
 import torch
 from torch import nn
 
+from .conditioning import CandidateCopyGeometry
 from .legal_moves import LegalMove
 from .state import JointAssignmentState
+
+_G_COPY_CONTEXT_MODES = ("mean", "orbit_slot", "orbit_slot_geometry")
 
 
 class RJumpHead(nn.Module):
@@ -86,13 +89,14 @@ class RJumpHead(nn.Module):
 class GJumpHead(nn.Module):
     """Symmetric pair head for legal G-moves.
 
-    ``mean``: exclusion mean copy context (J1.3-A baseline).
-    ``orbit_slot``: structured U[k,o] slots with remove-one exclusion (J1.3-B1).
+    ``mean``: exclusion mean copy context (J1.3-A / B0).
+    ``orbit_slot``: structured U[k,o] slots with remove-one exclusion (B1).
+    ``orbit_slot_geometry``: B1 slots + candidate→copy PBC radial relations (B2).
     """
 
     def __init__(self, hidden: int, *, copy_context_mode: str = "mean"):
         super().__init__()
-        if copy_context_mode not in ("mean", "orbit_slot"):
+        if copy_context_mode not in _G_COPY_CONTEXT_MODES:
             raise ValueError(f"unknown g copy_context_mode={copy_context_mode}")
         self.copy_context_mode = copy_context_mode
         in_dim = 2 * hidden + 2 * hidden + 2 * hidden
@@ -120,6 +124,23 @@ class GJumpHead(nn.Module):
         )
         nn.init.zeros_(self.slot_out[-1].weight)
         nn.init.zeros_(self.slot_out[-1].bias)
+        # B2: shared phi_rel(h_i, U_{k,o'}, z_o, z_{o'}, g, occ, t) + symmetric G MLP.
+        self.cand_geom = CandidateCopyGeometry(rbf_dim=32, cutoff=6.0)
+        rel_in = 4 * hidden + int(self.cand_geom.rbf_dim) + 1 + 32
+        self.phi_rel = nn.Sequential(
+            nn.Linear(rel_in, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+        )
+        # local pair + current/cross symmetric groups + t
+        geom_in = 8 * hidden + 32
+        self.geom_out = nn.Sequential(
+            nn.Linear(geom_in, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+        nn.init.zeros_(self.geom_out[-1].weight)
+        nn.init.zeros_(self.geom_out[-1].bias)
 
     def pair_logit(
         self,
@@ -210,6 +231,167 @@ class GJumpHead(nn.Module):
         logits = self.slot_out(torch.cat([local, q_pool, t_pair], dim=-1)).squeeze(-1)
         return logits, q_pool
 
+    def _encode_t(self, t_scalar: float, n: int, device, dtype) -> torch.Tensor:
+        t = torch.tensor([[float(t_scalar)]], device=device, dtype=dtype)
+        enc = self.t_enc(t)
+        return enc.expand(max(n, 1), -1)[:n] if n > 0 else enc[:0]
+
+    def _phi_rel_pool(
+        self,
+        h_i: torch.Tensor,
+        U: torch.Tensor,
+        z_o: torch.Tensor,
+        z_orbit: torch.Tensor,
+        g: torch.Tensor,
+        occ: torch.Tensor,
+        tenc: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """q_{i→k,o'} = φ_rel(...); q_{i→k} = masked mean over orbit slots."""
+        p, j_orb, hid = U.shape
+        hi_e = h_i.unsqueeze(1).expand(p, j_orb, -1)
+        zo_e = z_o.unsqueeze(1).expand(p, j_orb, -1)
+        zop_e = z_orbit.unsqueeze(0).expand(p, j_orb, -1)
+        t_e = tenc.unsqueeze(1).expand(p, j_orb, -1)
+        occ_e = occ.unsqueeze(-1)
+        feat = torch.cat([hi_e, U, zo_e, zop_e, g, occ_e, t_e], dim=-1)
+        q = self.phi_rel(feat)
+        mask = (occ > 0).to(dtype=q.dtype).unsqueeze(-1)
+        q = q * mask
+        q_pool = q.sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        return q, q_pool
+
+    def batch_logits_orbit_slot_geometry(
+        self,
+        h: torch.Tensor,
+        ii: torch.Tensor,
+        jj: torch.Tensor,
+        *,
+        z_orbit: torch.Tensor,
+        orbit_of: torch.Tensor,
+        copy_of: torch.Tensor,
+        U: torch.Tensor,
+        u_excl: torch.Tensor,
+        slot_cnt: torch.Tensor,
+        frac: torch.Tensor,
+        cell: torch.Tensor,
+        t_scalar: float,
+        K: int,
+        J: int,
+    ) -> tuple[torch.Tensor, dict]:
+        """Exclusion-aware candidate→copy geometry G logits (J1.3-B2).
+
+        For swap (i∈k, j∈l) the shared MLP sees four atom→copy relations:
+            i→k\\{i}, i→l\\{j}, j→l\\{j}, j→k\\{i}
+        combined as symmetric current / cross groups. No scalar ΔS / template.
+        """
+        empty = {
+            "candidate_copy_geom_norm_mean": 0.0,
+            "candidate_copy_geom_norm_std": 0.0,
+            "candidate_copy_relation_norm_mean": 0.0,
+            "candidate_copy_relation_norm_std": 0.0,
+            "candidate_copy_relation_variance_across_copies": 0.0,
+            "candidate_copy_relation_variance_across_candidates": 0.0,
+            "current_vs_cross_relation_distance": 0.0,
+            "g_logit_std_across_legal_moves": 0.0,
+        }
+        p = int(ii.numel())
+        if p == 0:
+            return h.new_zeros(0), empty
+
+        rbf = self.cand_geom.all_pairs_rbf(frac, cell)
+        G, cnt_geom = self.cand_geom.pool_to_slots(
+            rbf, copy_of=copy_of, orbit_of=orbit_of, K=K, J=J
+        )
+        ki = copy_of[ii].long()
+        li = copy_of[jj].long()
+        # Four exclusion-aware slot geometries.
+        g_ik, occ_ik = self.cand_geom.exclude_atom(
+            G, rbf, cnt_geom, query=ii, dest_copy=ki, exclude=ii, copy_of=copy_of, orbit_of=orbit_of
+        )
+        g_il, occ_il = self.cand_geom.exclude_atom(
+            G, rbf, cnt_geom, query=ii, dest_copy=li, exclude=jj, copy_of=copy_of, orbit_of=orbit_of
+        )
+        g_jl, occ_jl = self.cand_geom.exclude_atom(
+            G, rbf, cnt_geom, query=jj, dest_copy=li, exclude=jj, copy_of=copy_of, orbit_of=orbit_of
+        )
+        g_jk, occ_jk = self.cand_geom.exclude_atom(
+            G, rbf, cnt_geom, query=jj, dest_copy=ki, exclude=ii, copy_of=copy_of, orbit_of=orbit_of
+        )
+        # Matching U tables: own copy remove-self; dest copy remove-partner.
+        u_ik = u_excl[ii]
+        u_il = u_excl[jj]
+        u_jl = u_excl[jj]
+        u_jk = u_excl[ii]
+
+        hi, hj = h[ii], h[jj]
+        oi = orbit_of[ii].long()
+        oj = orbit_of[jj].long()
+        tenc = self._encode_t(t_scalar, p, h.device, h.dtype)
+        zo_i = z_orbit[oi]
+        zo_j = z_orbit[oj]
+
+        _, q_ik = self._phi_rel_pool(hi, u_ik, zo_i, z_orbit, g_ik, occ_ik, tenc)
+        _, q_il = self._phi_rel_pool(hi, u_il, zo_i, z_orbit, g_il, occ_il, tenc)
+        _, q_jl = self._phi_rel_pool(hj, u_jl, zo_j, z_orbit, g_jl, occ_jl, tenc)
+        _, q_jk = self._phi_rel_pool(hj, u_jk, zo_j, z_orbit, g_jk, occ_jk, tenc)
+
+        q_current_sum = q_ik + q_jl
+        q_current_dif = (q_ik - q_jl).abs()
+        q_cross_sum = q_il + q_jk
+        q_cross_dif = (q_il - q_jk).abs()
+        local = torch.cat([hi + hj, (hi - hj).abs(), zo_i, zo_j], dim=-1)
+        feat = torch.cat(
+            [local, q_current_sum, q_current_dif, q_cross_sum, q_cross_dif, tenc],
+            dim=-1,
+        )
+        logits = self.geom_out(feat).squeeze(-1)
+
+        # --- representation diagnostics (no extra learned scores) ---
+        g_stack = torch.stack([g_ik, g_il, g_jl, g_jk], dim=0)
+        g_norms = g_stack.norm(dim=-1)
+        q_stack = torch.stack([q_ik, q_il, q_jl, q_jk], dim=0)
+        q_norms = q_stack.norm(dim=-1)
+        cur_vs_crs = (q_current_sum - q_cross_sum).norm(dim=-1)
+        var_copies = 0.0
+        var_cands = 0.0
+        n = int(h.shape[0])
+        if n > 0 and K > 1:
+            g_all, occ_all = self.cand_geom.self_excluded_tables(
+                G, rbf, cnt_geom, copy_of=copy_of, orbit_of=orbit_of
+            )
+            u_all = U.unsqueeze(0).expand(n, -1, -1, -1).clone()
+            u_all[torch.arange(n, device=h.device), copy_of.long()] = u_excl
+            # Flatten (atom, copy) as independent queries for phi_rel.
+            nk = n * int(K)
+            h_f = h.unsqueeze(1).expand(n, K, -1).reshape(nk, -1)
+            u_f = u_all.reshape(nk, J, -1)
+            g_f = g_all.reshape(nk, J, -1)
+            occ_f = occ_all.reshape(nk, J)
+            zo_f = z_orbit[orbit_of.long()].unsqueeze(1).expand(n, K, -1).reshape(nk, -1)
+            t_all = self._encode_t(t_scalar, nk, h.device, h.dtype)
+            _, q_all = self._phi_rel_pool(h_f, u_f, zo_f, z_orbit, g_f, occ_f, t_all)
+            q_all = q_all.view(n, K, -1)
+            var_copies = float(q_all.var(dim=1, unbiased=False).mean().detach())
+            var_cands = float(q_all.var(dim=0, unbiased=False).mean().detach()) if n > 1 else 0.0
+
+        diag = {
+            "candidate_copy_geom_norm_mean": float(g_norms.mean().detach()),
+            "candidate_copy_geom_norm_std": float(g_norms.std(unbiased=False).detach())
+            if g_norms.numel() > 1
+            else 0.0,
+            "candidate_copy_relation_norm_mean": float(q_norms.mean().detach()),
+            "candidate_copy_relation_norm_std": float(q_norms.std(unbiased=False).detach())
+            if q_norms.numel() > 1
+            else 0.0,
+            "candidate_copy_relation_variance_across_copies": var_copies,
+            "candidate_copy_relation_variance_across_candidates": var_cands,
+            "current_vs_cross_relation_distance": float(cur_vs_crs.mean().detach()),
+            "g_logit_std_across_legal_moves": float(logits.detach().std(unbiased=False))
+            if p > 1
+            else 0.0,
+        }
+        return logits, diag
+
 
 def _exclusion_contexts(
     h: torch.Tensor,
@@ -248,6 +430,8 @@ def compute_move_logits(
     g_head: GJumpHead,
     slot_ctx=None,
     t_scalar: float = 0.0,
+    frac: torch.Tensor | None = None,
+    cell: torch.Tensor | None = None,
 ) -> tuple[dict[str, list[tuple[LegalMove, torch.Tensor]]], dict]:
     """Score all legal moves; batched MLP forwards.
 
@@ -277,7 +461,8 @@ def compute_move_logits(
         ii = torch.tensor([m.i for m in g_moves], device=device, dtype=torch.long)
         jj = torch.tensor([m.j for m in g_moves], device=device, dtype=torch.long)
         mode = getattr(g_head, "copy_context_mode", "mean")
-        if mode == "orbit_slot" and slot_ctx is not None:
+        use_slots = mode in ("orbit_slot", "orbit_slot_geometry") and slot_ctx is not None
+        if use_slots:
             U, feat, cnt = slot_ctx.slot_table(
                 h,
                 orbit_of=orbit_of,
@@ -287,11 +472,30 @@ def compute_move_logits(
                 J=state.J,
             )
             u_excl = slot_ctx.exclude_atom_slots(U, cnt, feat, orbit_of, copy_of)
-            logits, q_pool = g_head.batch_logits_orbit_slot(
-                h, ii, jj, z_orbit=z_orbit, orbit_of=orbit_of, u_excl=u_excl, t_scalar=t_scalar
-            )
             slot_diag.update(slot_ctx.slot_diagnostics(U))
-            slot_diag["slot_pair_feature_norm"] = float(q_pool.norm(dim=-1).mean().detach())
+            if mode == "orbit_slot_geometry" and frac is not None and cell is not None:
+                logits, rel_diag = g_head.batch_logits_orbit_slot_geometry(
+                    h,
+                    ii,
+                    jj,
+                    z_orbit=z_orbit,
+                    orbit_of=orbit_of,
+                    copy_of=copy_of,
+                    U=U,
+                    u_excl=u_excl,
+                    slot_cnt=cnt,
+                    frac=frac,
+                    cell=cell,
+                    t_scalar=t_scalar,
+                    K=state.K,
+                    J=state.J,
+                )
+                slot_diag.update(rel_diag)
+            else:
+                logits, q_pool = g_head.batch_logits_orbit_slot(
+                    h, ii, jj, z_orbit=z_orbit, orbit_of=orbit_of, u_excl=u_excl, t_scalar=t_scalar
+                )
+                slot_diag["slot_pair_feature_norm"] = float(q_pool.norm(dim=-1).mean().detach())
         else:
             excl = _exclusion_contexts(h, copy_of, v_copies)
             logits = g_head.batch_logits(
@@ -299,6 +503,12 @@ def compute_move_logits(
             )
         for m, logit in zip(g_moves, logits):
             out["G"].append((m, logit))
+        if "g_logit_std_across_legal_moves" not in slot_diag:
+            if len(g_moves) > 1:
+                stacked = torch.stack([lg.detach() for _, lg in out["G"]])
+                slot_diag["g_logit_std_across_legal_moves"] = float(stacked.std(unbiased=False))
+            else:
+                slot_diag["g_logit_std_across_legal_moves"] = 0.0
     return out, slot_diag
 
 
@@ -375,4 +585,5 @@ def jump_pool_diagnostics(
         # Σ r = β when n>0
         out[f"total_rate_{kind}"] = float(beta) if beta > 0 else 0.0
         out[f"pi_max_{kind}"] = float(probs.max())
+    out["g_logit_std_across_legal_moves"] = float(out.get("logit_std_G", 0.0))
     return out

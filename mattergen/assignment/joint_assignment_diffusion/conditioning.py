@@ -4,6 +4,11 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from mattergen.assignment.global_copy_assembly.pair_potential import (
+    gaussian_radial_basis,
+    pbc_minimum_image_distance,
+)
+
 
 class OrbitRelationTable(nn.Module):
     """Learned embedding of orbit-pair molecular relation ρ_{oo'}."""
@@ -272,6 +277,132 @@ class OrbitSlotCopyContext(nn.Module):
             "slot_embedding_norm_std": float(norms.std(unbiased=False).detach()) if norms.numel() > 1 else 0.0,
             "slot_orbit_pairwise_var": float(var_o.detach()),
         }
+
+
+class CandidateCopyGeometry(nn.Module):
+    """PBC min-image Gaussian RBF from a query atom to copy×orbit slots.
+
+    Distance / RBF convention is imported from ``pair_potential`` (same wrap
+    and Gaussian width as BondPairPotential). Scalar invariant features only;
+    no Cartesian direction vectors.
+    """
+
+    def __init__(self, rbf_dim: int = 32, cutoff: float = 6.0):
+        super().__init__()
+        self.rbf_dim = int(rbf_dim)
+        self.cutoff = float(cutoff)
+        self.register_buffer("centres", torch.linspace(0.0, self.cutoff, self.rbf_dim))
+
+    def all_pairs_rbf(self, frac: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
+        """RBF[i, r] = Gaussian-RBF(d_PBC(i, r)). Shape [N, N, R]."""
+        if frac.ndim != 2 or frac.shape[-1] != 3:
+            raise ValueError(f"frac must be [N,3], got {tuple(frac.shape)}")
+        n = frac.shape[0]
+        if n == 0:
+            return frac.new_zeros(0, 0, self.rbf_dim)
+        cell = cell.to(device=frac.device, dtype=frac.dtype)
+        dist = pbc_minimum_image_distance(frac[:, None, :], frac[None, :, :], cell)
+        return gaussian_radial_basis(dist, self.centres.to(device=frac.device, dtype=frac.dtype), self.cutoff)
+
+    def pool_to_slots(
+        self,
+        rbf: torch.Tensor,
+        *,
+        copy_of: torch.Tensor,
+        orbit_of: torch.Tensor,
+        K: int,
+        J: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Mean-pool target atoms into copy×orbit slots.
+
+        Returns:
+            G: [N, K, J, R]  query i → slot (k, o')
+            cnt: [K, J]      slot multiplicity (before any exclusion)
+        """
+        n, n2, rdim = rbf.shape
+        device, dtype = rbf.device, rbf.dtype
+        G = torch.zeros(n, K * J, rdim, device=device, dtype=dtype)
+        cnt = torch.zeros(K * J, device=device, dtype=dtype)
+        if n == 0:
+            return G.view(n, K, J, rdim), cnt.view(K, J)
+        flat = copy_of.long() * int(J) + orbit_of.long()
+        G.index_add_(1, flat, rbf)
+        cnt.index_add_(0, flat, torch.ones(n, device=device, dtype=dtype))
+        G = G / cnt.clamp_min(1.0).view(1, -1, 1)
+        return G.view(n, K, J, rdim), cnt.view(K, J)
+
+    def exclude_atom(
+        self,
+        G: torch.Tensor,
+        rbf: torch.Tensor,
+        cnt: torch.Tensor,
+        *,
+        query: torch.Tensor,
+        dest_copy: torch.Tensor,
+        exclude: torch.Tensor,
+        copy_of: torch.Tensor,
+        orbit_of: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Slot geometry G[query, dest_copy] with ``exclude`` removed if it lives there.
+
+        Empty slots after remove-one become a zero RBF and occupancy 0 (no NaN,
+        no leftover self-distance-0 peak).
+        """
+        g0 = G[query, dest_copy]  # [P, J, R]
+        occ0 = cnt[dest_copy]  # [P, J]
+        if query.numel() == 0:
+            return g0, occ0
+        o_ex = orbit_of[exclude].long()
+        in_dest = copy_of[exclude].long() == dest_copy.long()
+        r_ex = rbf[query, exclude]  # [P, R]
+        p = int(query.shape[0])
+        ar = torch.arange(p, device=query.device)
+        g_slot = g0[ar, o_ex]
+        c_slot = occ0[ar, o_ex]
+        new_slot = (c_slot.unsqueeze(-1) * g_slot - r_ex) / (c_slot - 1.0).clamp_min(1.0).unsqueeze(-1)
+        empty = in_dest & (c_slot <= 1.0)
+        new_slot = torch.where(
+            (~in_dest).unsqueeze(-1),
+            g_slot,
+            torch.where(empty.unsqueeze(-1), torch.zeros_like(new_slot), new_slot),
+        )
+        g_out = g0.clone()
+        g_out[ar, o_ex] = new_slot
+        occ_out = occ0.clone()
+        occ_out[ar, o_ex] = torch.where(in_dest, (c_slot - 1.0).clamp_min(0.0), c_slot)
+        return g_out, occ_out
+
+    def self_excluded_tables(
+        self,
+        G: torch.Tensor,
+        rbf: torch.Tensor,
+        cnt: torch.Tensor,
+        *,
+        copy_of: torch.Tensor,
+        orbit_of: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-atom, all-copy geometry with each atom removed from its own slot.
+
+        Dest copies that do not contain the query are unchanged. Used for
+        representation diagnostics (variance across copies / candidates).
+        """
+        n, k, j, _r = G.shape
+        g_all = G.clone()
+        occ_all = cnt.unsqueeze(0).expand(n, -1, -1).clone()
+        if n == 0:
+            return g_all, occ_all
+        ar = torch.arange(n, device=G.device)
+        k_i = copy_of.long()
+        o_i = orbit_of.long()
+        c_slot = cnt[k_i, o_i]
+        g_slot = g_all[ar, k_i, o_i]
+        r_self = rbf[ar, ar]
+        new_slot = (c_slot.unsqueeze(-1) * g_slot - r_self) / (c_slot - 1.0).clamp_min(1.0).unsqueeze(-1)
+        new_slot = torch.where(c_slot.unsqueeze(-1) <= 1.0, torch.zeros_like(new_slot), new_slot)
+        g_all[ar, k_i, o_i] = new_slot
+        occ_all = occ_all.clone()
+        occ_all[ar, k_i, o_i] = (c_slot - 1.0).clamp_min(0.0)
+        return g_all, occ_all
 
 
 class SpatialEdgeAssignmentFeaturizer(nn.Module):

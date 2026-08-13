@@ -235,6 +235,20 @@ def event_conditioned_assignment_ce(
         "slot_embedding_norm_std": out.diagnostics.get("slot_embedding_norm_std", 0.0),
         "slot_pair_feature_norm": out.diagnostics.get("slot_pair_feature_norm", 0.0),
         "slot_orbit_pairwise_var": out.diagnostics.get("slot_orbit_pairwise_var", 0.0),
+        "candidate_copy_geom_norm_mean": out.diagnostics.get("candidate_copy_geom_norm_mean", 0.0),
+        "candidate_copy_geom_norm_std": out.diagnostics.get("candidate_copy_geom_norm_std", 0.0),
+        "candidate_copy_relation_norm_mean": out.diagnostics.get("candidate_copy_relation_norm_mean", 0.0),
+        "candidate_copy_relation_norm_std": out.diagnostics.get("candidate_copy_relation_norm_std", 0.0),
+        "candidate_copy_relation_variance_across_copies": out.diagnostics.get(
+            "candidate_copy_relation_variance_across_copies", 0.0
+        ),
+        "candidate_copy_relation_variance_across_candidates": out.diagnostics.get(
+            "candidate_copy_relation_variance_across_candidates", 0.0
+        ),
+        "current_vs_cross_relation_distance": out.diagnostics.get(
+            "current_vs_cross_relation_distance", 0.0
+        ),
+        "g_logit_std_across_legal_moves": out.diagnostics.get("g_logit_std_across_legal_moves", 0.0),
     }
 
 
@@ -281,6 +295,20 @@ def event_conditioned_g_teacher_ce(
         "slot_embedding_norm_std": out.diagnostics.get("slot_embedding_norm_std", 0.0),
         "slot_pair_feature_norm": out.diagnostics.get("slot_pair_feature_norm", 0.0),
         "slot_orbit_pairwise_var": out.diagnostics.get("slot_orbit_pairwise_var", 0.0),
+        "candidate_copy_geom_norm_mean": out.diagnostics.get("candidate_copy_geom_norm_mean", 0.0),
+        "candidate_copy_geom_norm_std": out.diagnostics.get("candidate_copy_geom_norm_std", 0.0),
+        "candidate_copy_relation_norm_mean": out.diagnostics.get("candidate_copy_relation_norm_mean", 0.0),
+        "candidate_copy_relation_norm_std": out.diagnostics.get("candidate_copy_relation_norm_std", 0.0),
+        "candidate_copy_relation_variance_across_copies": out.diagnostics.get(
+            "candidate_copy_relation_variance_across_copies", 0.0
+        ),
+        "candidate_copy_relation_variance_across_candidates": out.diagnostics.get(
+            "candidate_copy_relation_variance_across_candidates", 0.0
+        ),
+        "current_vs_cross_relation_distance": out.diagnostics.get(
+            "current_vs_cross_relation_distance", 0.0
+        ),
+        "g_logit_std_across_legal_moves": out.diagnostics.get("g_logit_std_across_legal_moves", 0.0),
         **tdiag,
         **pqual,
     }

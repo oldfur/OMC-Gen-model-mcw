@@ -5,6 +5,34 @@ import torch
 from torch import nn
 
 
+def pbc_minimum_image_distance(
+    frac_a: torch.Tensor,
+    frac_b: torch.Tensor,
+    cell: torch.Tensor,
+) -> torch.Tensor:
+    """Minimum-image Euclidean distance under periodic wrap.
+
+    Same convention as the historical ``BondPairPotential`` / orbit-attachment
+    helpers: wrap ``frac_b - frac_a`` with ``torch.round``, then
+    ``||delta @ cell||`` (row-vector fractional coordinates).
+    """
+    delta = frac_b - frac_a
+    delta = delta - torch.round(delta)
+    if cell.ndim == 3:
+        cell = cell.reshape(-1, 3, 3)[0]
+    return torch.linalg.norm(delta @ cell, dim=-1)
+
+
+def gaussian_radial_basis(
+    distance: torch.Tensor,
+    centres: torch.Tensor,
+    cutoff: float,
+) -> torch.Tensor:
+    """Gaussian RBF ``exp(-((d-c)/(cutoff/n))^2)`` used by BondPairPotential."""
+    scale = float(cutoff) / max(1, int(centres.numel()))
+    return torch.exp(-((distance.unsqueeze(-1) - centres) / scale) ** 2)
+
+
 class BondPairPotential(nn.Module):
     """Maps K-by-K role-instance pairs to scalar molecular-bond compatibilities.
 
@@ -28,9 +56,8 @@ class BondPairPotential(nn.Module):
             raise ValueError("tree pair potential expects equal [K,H] instance embeddings")
         if frac_left.shape != frac_right.shape or frac_left.shape != (len(h_left), 3):
             raise ValueError("role-instance positions must have shape [K,3]")
-        delta=frac_right[None,:,:]-frac_left[:,None,:]; delta=delta-torch.round(delta)
-        distance=torch.linalg.norm(delta@cell,dim=-1)
-        rbf=torch.exp(-((distance[...,None]-self.centres)/(self.cutoff/max(1,len(self.centres))))**2)
+        distance = pbc_minimum_image_distance(frac_left[:, None, :], frac_right[None, :, :], cell)
+        rbf = gaussian_radial_basis(distance, self.centres, self.cutoff)
         left=h_left[:,None,:].expand(-1,len(h_right),-1); right=h_right[None,:,:].expand(len(h_left),-1,-1)
         bond=self.bond_embedding(torch.as_tensor(bond_type,device=h_left.device).long().clamp(0,self.bond_embedding.num_embeddings-1)).view(1,1,-1).expand_as(left)
         roles=torch.cat([h_role_left,h_role_right],-1).view(1,1,-1).expand(len(h_left),len(h_right),-1)

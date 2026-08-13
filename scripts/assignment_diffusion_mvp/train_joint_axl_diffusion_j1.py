@@ -155,7 +155,7 @@ def main() -> None:
 
     sch_cfg = cfg.get("schedule") or {}
     schedule = AsyncJumpSchedule.from_config(sch_cfg)
-    g_ctx = str(cfg.get("g_copy_context_mode") or "orbit_slot")
+    g_ctx = str(cfg.get("g_copy_context_mode") or "orbit_slot_geometry")
     model = JointAXLModel(
         denoiser, num_orbits=partition.J, schedule=schedule, g_copy_context_mode=g_ctx
     ).to(device)
@@ -186,9 +186,10 @@ def main() -> None:
         "JOINT_TIME": "single_global_tau_or_t",
         "J1_2": "event_conditioned_assignment",
         "J1_3A": "improvement_weighted_g_teacher",
+        "J1_3B2": "candidate_to_copy_pbc_geometry",
         "G_SUPERVISION": str((cfg.get("g_supervision") or "improvement_weighted")),
         "G_TEACHER_TEMPERATURE": float((cfg.get("g_teacher_temperature") or 0.02)),
-        "G_COPY_CONTEXT_MODE": str(cfg.get("g_copy_context_mode") or "orbit_slot"),
+        "G_COPY_CONTEXT_MODE": str(cfg.get("g_copy_context_mode") or "orbit_slot_geometry"),
         "R_WINDOW": list(schedule.r_window),
         "G_WINDOW": list(schedule.g_window),
         "KAPPA_R": schedule.kappa_r,
@@ -385,6 +386,14 @@ def main() -> None:
                     "slot_embedding_norm_std",
                     "slot_pair_feature_norm",
                     "slot_orbit_pairwise_var",
+                    "candidate_copy_geom_norm_mean",
+                    "candidate_copy_geom_norm_std",
+                    "candidate_copy_relation_norm_mean",
+                    "candidate_copy_relation_norm_std",
+                    "candidate_copy_relation_variance_across_copies",
+                    "candidate_copy_relation_variance_across_candidates",
+                    "current_vs_cross_relation_distance",
+                    "g_logit_std_across_legal_moves",
                 ):
                     if k in ev_diag and ev_diag[k] is not None:
                         v = ev_diag[k]

@@ -320,3 +320,265 @@ def test_enumerate_moves_vectorized_matches_bruteforce():
     }
     assert {(m.i, m.j) for m in enumerate_r_moves(st)} == brute_r
     assert {(m.i, m.j) for m in enumerate_g_moves(st)} == brute_g
+
+
+def _init_g_head_nonzero(head):
+    import torch.nn as nn
+
+    for p in head.parameters():
+        if p.dim() >= 2:
+            nn.init.xavier_uniform_(p)
+        else:
+            nn.init.zeros_(p)
+    if hasattr(head, "geom_out"):
+        nn.init.xavier_uniform_(head.geom_out[-1].weight)
+        nn.init.zeros_(head.geom_out[-1].bias)
+    if hasattr(head, "slot_out"):
+        nn.init.xavier_uniform_(head.slot_out[-1].weight)
+        nn.init.zeros_(head.slot_out[-1].bias)
+    if hasattr(head, "net"):
+        nn.init.xavier_uniform_(head.net[-1].weight)
+        nn.init.zeros_(head.net[-1].bias)
+
+
+def test_pbc_min_image_matches_pair_potential_convention():
+    """B2 reuses BondPairPotential wrap: Δu = round(frac_b-frac_a), ||Δu @ cell||."""
+    from mattergen.assignment.global_copy_assembly.pair_potential import (
+        gaussian_radial_basis,
+        pbc_minimum_image_distance,
+    )
+
+    frac_a = torch.tensor([[0.1, 0.2, 0.3]])
+    frac_b = torch.tensor([[0.9, 0.2, 0.3]])
+    cell = torch.eye(3) * 10.0
+    dist = pbc_minimum_image_distance(frac_a, frac_b, cell)
+    assert torch.allclose(dist, torch.tensor([2.0]), atol=1e-5)
+    centres = torch.linspace(0.0, 6.0, 32)
+    rbf = gaussian_radial_basis(dist, centres, 6.0)
+    assert rbf.shape == (1, 32)
+    assert torch.isfinite(rbf).all()
+    # batched [N,N] same formula as BondPairPotential.forward
+    frac = torch.tensor([[0.0, 0.0, 0.0], [0.6, 0.0, 0.0]])
+    d2 = pbc_minimum_image_distance(frac[:, None, :], frac[None, :, :], cell)
+    assert torch.allclose(d2[0, 1], torch.tensor(4.0), atol=1e-5)
+
+
+def test_candidate_copy_geometry_empty_slot_and_no_self_distance():
+    """Singleton remove-one → zero RBF (not d=0 peak); no NaN."""
+    from mattergen.assignment.joint_assignment_diffusion.conditioning import CandidateCopyGeometry
+
+    torch.manual_seed(0)
+    geom = CandidateCopyGeometry(rbf_dim=32, cutoff=6.0)
+    # two copies, two singleton orbits
+    frac = torch.tensor(
+        [
+            [0.10, 0.10, 0.10],
+            [0.12, 0.20, 0.10],
+            [0.60, 0.10, 0.10],
+            [0.62, 0.20, 0.10],
+        ],
+        dtype=torch.float32,
+    )
+    copy_of = torch.tensor([0, 0, 1, 1])
+    orbit_of = torch.tensor([0, 1, 0, 1])
+    cell = torch.eye(3) * 8.0
+    rbf = geom.all_pairs_rbf(frac, cell)
+    G, cnt = geom.pool_to_slots(rbf, copy_of=copy_of, orbit_of=orbit_of, K=2, J=2)
+    assert (cnt == 1).all()
+    q = torch.tensor([0])
+    g_own, occ_own = geom.exclude_atom(
+        G, rbf, cnt, query=q, dest_copy=torch.tensor([0]), exclude=q, copy_of=copy_of, orbit_of=orbit_of
+    )
+    assert occ_own[0, 0].item() == 0.0
+    assert torch.allclose(g_own[0, 0], torch.zeros_like(g_own[0, 0]))
+    # leftover self-distance would be RBF(0) ≠ 0
+    rbf0 = geom.all_pairs_rbf(frac[0:1], cell)[0, 0]
+    assert rbf0.norm() > 0.5
+    assert not torch.allclose(g_own[0, 0], rbf0)
+    assert torch.isfinite(g_own).all()
+    # dest copy excluding partner: atom 0 → copy 1 \ {2}
+    g_dst, occ_dst = geom.exclude_atom(
+        G,
+        rbf,
+        cnt,
+        query=q,
+        dest_copy=torch.tensor([1]),
+        exclude=torch.tensor([2]),
+        copy_of=copy_of,
+        orbit_of=orbit_of,
+    )
+    assert occ_dst[0, 0].item() == 0.0
+    assert torch.allclose(g_dst[0, 0], torch.zeros_like(g_dst[0, 0]))
+    assert occ_dst[0, 1].item() == 1.0
+    assert g_dst[0, 1].norm() > 0
+
+
+def test_candidate_copy_geometry_slot_multiplicity_invariance():
+    """Permuting atoms inside one orbit slot does not change pooled g."""
+    from mattergen.assignment.joint_assignment_diffusion.conditioning import CandidateCopyGeometry
+
+    torch.manual_seed(1)
+    geom = CandidateCopyGeometry(rbf_dim=16, cutoff=6.0)
+    # copy 0: atoms 0,1 in orbit 0 (multiplicity 2); atom 2 orbit 1
+    # copy 1: atoms 3,4 orbit 0; atom 5 orbit 1
+    frac = torch.tensor(
+        [
+            [0.05, 0.05, 0.00],
+            [0.08, 0.15, 0.02],
+            [0.10, 0.40, 0.00],
+            [0.55, 0.05, 0.00],
+            [0.70, 0.18, 0.03],
+            [0.58, 0.42, 0.00],
+        ],
+        dtype=torch.float32,
+    )
+    copy_of = torch.tensor([0, 0, 0, 1, 1, 1])
+    orbit_of = torch.tensor([0, 0, 1, 0, 0, 1])
+    cell = torch.eye(3) * 10.0
+    rbf = geom.all_pairs_rbf(frac, cell)
+    G, cnt = geom.pool_to_slots(rbf, copy_of=copy_of, orbit_of=orbit_of, K=2, J=2)
+    assert int(cnt[1, 0].item()) == 2
+    # query atom 2 (external to dest slot orbit 0 of copy 1)
+    g_a, _ = geom.exclude_atom(
+        G,
+        rbf,
+        cnt,
+        query=torch.tensor([2]),
+        dest_copy=torch.tensor([1]),
+        exclude=torch.tensor([5]),
+        copy_of=copy_of,
+        orbit_of=orbit_of,
+    )
+    frac_swap = frac.clone()
+    frac_swap[3], frac_swap[4] = frac[4].clone(), frac[3].clone()
+    rbf_b = geom.all_pairs_rbf(frac_swap, cell)
+    G_b, cnt_b = geom.pool_to_slots(rbf_b, copy_of=copy_of, orbit_of=orbit_of, K=2, J=2)
+    g_b, _ = geom.exclude_atom(
+        G_b,
+        rbf_b,
+        cnt_b,
+        query=torch.tensor([2]),
+        dest_copy=torch.tensor([1]),
+        exclude=torch.tensor([5]),
+        copy_of=copy_of,
+        orbit_of=orbit_of,
+    )
+    assert torch.allclose(g_a, g_b, atol=1e-5)
+
+
+def test_candidate_copy_geometry_pair_and_copy_symmetry():
+    """(i,j) vs (j,i) same logit; copy-column permutation leaves logits invariant."""
+    import torch.nn as nn
+
+    from mattergen.assignment.joint_assignment_diffusion.conditioning import OrbitSlotCopyContext
+    from mattergen.assignment.joint_assignment_diffusion.jump_heads import GJumpHead
+
+    torch.manual_seed(2)
+    n, hid, k, j = 6, 8, 2, 3
+    orbit_of = torch.tensor([0, 1, 2, 0, 1, 2])
+    copy_of = torch.tensor([0, 0, 0, 1, 1, 1])
+    h = torch.randn(n, hid)
+    z_orbit = torch.randn(j, hid)
+    frac = torch.rand(n, 3)
+    cell = torch.eye(3) * 9.0
+    ctx = OrbitSlotCopyContext(hid)
+    U, feat, cnt = ctx.slot_table(h, orbit_of=orbit_of, copy_of=copy_of, z_orbit=z_orbit, K=k, J=j)
+    u_excl = ctx.exclude_atom_slots(U, cnt, feat, orbit_of, copy_of)
+    head = GJumpHead(hid, copy_context_mode="orbit_slot_geometry")
+    _init_g_head_nonzero(head)
+
+    ii = torch.tensor([0, 1, 2])
+    jj = torch.tensor([3, 4, 5])
+    logits, diag = head.batch_logits_orbit_slot_geometry(
+        h,
+        ii,
+        jj,
+        z_orbit=z_orbit,
+        orbit_of=orbit_of,
+        copy_of=copy_of,
+        U=U,
+        u_excl=u_excl,
+        slot_cnt=cnt,
+        frac=frac,
+        cell=cell,
+        t_scalar=0.45,
+        K=k,
+        J=j,
+    )
+    logits_swap, _ = head.batch_logits_orbit_slot_geometry(
+        h,
+        jj,
+        ii,
+        z_orbit=z_orbit,
+        orbit_of=orbit_of,
+        copy_of=copy_of,
+        U=U,
+        u_excl=u_excl,
+        slot_cnt=cnt,
+        frac=frac,
+        cell=cell,
+        t_scalar=0.45,
+        K=k,
+        J=j,
+    )
+    assert torch.allclose(logits, logits_swap, atol=1e-5)
+    assert torch.isfinite(logits).all()
+    assert diag["candidate_copy_geom_norm_mean"] > 0.0
+    assert diag["candidate_copy_relation_variance_across_copies"] >= 0.0
+
+    # copy-column permutation: physical pairs unchanged → same logits
+    perm = torch.tensor([1, 0])
+    copy2 = perm[copy_of]
+    U2, feat2, cnt2 = ctx.slot_table(h, orbit_of=orbit_of, copy_of=copy2, z_orbit=z_orbit, K=k, J=j)
+    u_ex2 = ctx.exclude_atom_slots(U2, cnt2, feat2, orbit_of, copy2)
+    logits_p, _ = head.batch_logits_orbit_slot_geometry(
+        h,
+        ii,
+        jj,
+        z_orbit=z_orbit,
+        orbit_of=orbit_of,
+        copy_of=copy2,
+        U=U2,
+        u_excl=u_ex2,
+        slot_cnt=cnt2,
+        frac=frac,
+        cell=cell,
+        t_scalar=0.45,
+        K=k,
+        J=j,
+    )
+    assert torch.allclose(logits, logits_p, atol=1e-5)
+
+    # zero last layer still uniform (start-of-training)
+    nn.init.zeros_(head.geom_out[-1].weight)
+    nn.init.zeros_(head.geom_out[-1].bias)
+    logits0, _ = head.batch_logits_orbit_slot_geometry(
+        h,
+        ii,
+        jj,
+        z_orbit=z_orbit,
+        orbit_of=orbit_of,
+        copy_of=copy_of,
+        U=U,
+        u_excl=u_excl,
+        slot_cnt=cnt,
+        frac=frac,
+        cell=cell,
+        t_scalar=0.45,
+        K=k,
+        J=j,
+    )
+    assert torch.allclose(logits0, torch.zeros_like(logits0), atol=1e-6)
+
+
+def test_g_copy_context_modes_b0_b1_b2_still_registered():
+    """Ablation switch keeps mean / orbit_slot / orbit_slot_geometry."""
+    from mattergen.assignment.joint_assignment_diffusion.jump_heads import (
+        GJumpHead,
+        _G_COPY_CONTEXT_MODES,
+    )
+
+    assert _G_COPY_CONTEXT_MODES == ("mean", "orbit_slot", "orbit_slot_geometry")
+    for mode in _G_COPY_CONTEXT_MODES:
+        head = GJumpHead(8, copy_context_mode=mode)
+        assert head.copy_context_mode == mode
