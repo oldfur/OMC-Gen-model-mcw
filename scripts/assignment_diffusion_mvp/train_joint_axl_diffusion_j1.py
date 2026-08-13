@@ -388,7 +388,12 @@ def main() -> None:
                 ):
                     if k in ev_diag and ev_diag[k] is not None:
                         v = ev_diag[k]
-                        rec[k] = float(v) if not isinstance(v, bool) else float(v)
+                        if torch.is_tensor(v):
+                            rec[k] = float(v.detach())
+                        elif isinstance(v, str):
+                            rec[k] = v
+                        else:
+                            rec[k] = float(v)
                 event_records.append(rec)
             else:
                 geom = geometry_step_loss(
