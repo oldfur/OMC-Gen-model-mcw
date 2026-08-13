@@ -146,12 +146,14 @@ def main() -> None:
                 "num_events": len(traj.events),
                 "n_R": budget["n_R"],
                 "n_G": budget["n_G"],
-                "expected_R": budget["expected_R"],
-                "expected_G": budget["expected_G"],
-                "H_R": budget["H_R"],
-                "H_G": budget["H_G"],
-                "ratio_R": budget["ratio_R"],
-                "ratio_G": budget["ratio_G"],
+                "H_R_full": budget["H_R_full"],
+                "H_G_full": budget["H_G_full"],
+                "H_R_segment": budget["H_R_segment"],
+                "H_G_segment": budget["H_G_segment"],
+                "expected_R_segment": budget["expected_R_segment"],
+                "expected_G_segment": budget["expected_G_segment"],
+                "ratio_R_vs_segment": budget["ratio_R_vs_segment"],
+                "ratio_G_vs_segment": budget["ratio_G_vs_segment"],
                 "jumps_per_bin": traj.diagnostics.get("jumps_per_bin", {}),
                 **leg,
                 **locks,
@@ -192,12 +194,16 @@ def main() -> None:
     gate = {
         "ctmc_mean_n_R": sum(r["n_R"] for r in ctmc_rows) / max(1, len(ctmc_rows)),
         "ctmc_mean_n_G": sum(r["n_G"] for r in ctmc_rows) / max(1, len(ctmc_rows)),
-        "expected_R": schedule.kappa_r,
-        "expected_G": schedule.kappa_g,
+        "H_R_segment": schedule.integrated_beta(0.0, 1.0, kind="R"),
+        "H_G_segment": schedule.integrated_beta(0.0, 1.0, kind="G"),
+        "expected_R_segment": schedule.integrated_beta(0.0, 1.0, kind="R"),
+        "expected_G_segment": schedule.integrated_beta(0.0, 1.0, kind="G"),
         "static_all_zero_jumps": all(
             r["num_events"] == 0 for r in results if r["assignment_mode"] == "static_A"
         ),
         "ctmc_not_systematically_zero": any(r["num_events"] > 0 for r in ctmc_rows),
+        "ctmc_g_not_systematically_zero": any(r["n_G"] > 0 for r in ctmc_rows),
+        "ctmc_r_not_systematically_zero": any(r["n_R"] > 0 for r in ctmc_rows),
     }
     (out / "sample_gate.json").write_text(json.dumps(gate, indent=2))
     print(json.dumps({"event": "j1_sample_done", "n": len(results), "output": str(out), **gate}), flush=True)

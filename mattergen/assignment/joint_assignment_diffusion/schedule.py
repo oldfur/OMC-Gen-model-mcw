@@ -169,9 +169,9 @@ class AsyncJumpSchedule:
         g_on: bool = True,
         n_bisect: int = 48,
     ) -> float | None:
-        """Find τ ∈ [t_low, t_high] s.t. ∫_τ^{t_high} λ = hazard (reverse waiting).
+        """Reverse-time inverse: find τ ∈ [t_low, t_high] s.t. ∫_τ^{t_high} λ = hazard.
 
-        Returns None if total hazard on [t_low, t_high] < hazard (no event).
+        Used by reverse Gillespie (time decreasing). Returns None if no event.
         """
         H_full = self.integrated_hazard_total(t_low, t_high, r_on=r_on, g_on=g_on)
         if hazard > H_full + 1e-12 or H_full <= 1e-30:
@@ -188,6 +188,43 @@ class AsyncJumpSchedule:
             else:
                 hi = mid
         return 0.5 * (lo + hi)
+
+    def inverse_integrated_hazard_forward(
+        self,
+        t_low: float,
+        hazard: float,
+        *,
+        t_high: float,
+        r_on: bool = True,
+        g_on: bool = True,
+        n_bisect: int = 48,
+    ) -> float | None:
+        """Forward-time inverse: find τ ∈ [t_low, t_high] s.t. ∫_{t_low}^τ λ = hazard.
+
+        Used by forward CTMC (time increasing). Returns None if hazard exceeds
+        segment mass (no event before t_high).
+        """
+        H_full = self.integrated_hazard_total(t_low, t_high, r_on=r_on, g_on=g_on)
+        if hazard > H_full + 1e-12 or H_full <= 1e-30:
+            return None
+        if hazard <= 1e-15:
+            return float(t_low)
+        # Equivalent: remaining reverse hazard from τ to t_high is H_full - hazard
+        remaining = H_full - float(hazard)
+        if remaining <= 1e-15:
+            return float(t_high)
+        return self.inverse_integrated_hazard(
+            t_high, remaining, t_low=t_low, r_on=r_on, g_on=g_on, n_bisect=n_bisect
+        )
+
+    def next_mobility_time(self, t: float, t_end: float) -> float:
+        """Next time > t where a mobility window opens or closes, or t_end."""
+        candidates = [float(t_end)]
+        for lo, hi in (self.r_window, self.g_window):
+            for x in (lo, hi):
+                if t < x < t_end:
+                    candidates.append(float(x))
+        return min(candidates)
 
     def sample_t_proportional_to_beta(
         self,

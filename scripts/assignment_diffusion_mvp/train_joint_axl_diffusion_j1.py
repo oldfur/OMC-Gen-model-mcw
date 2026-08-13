@@ -169,7 +169,8 @@ def main() -> None:
     prov = {
         "J1_MODE": "joint_axl_ctmc_j1_1",
         "RATE_MODEL": "fixed_exit_beta_softmax",
-        "ASSIGNMENT_LOSS": "reverse_categorical_nll",
+        "ASSIGNMENT_LOSS": "reverse_categorical_nll_event_mean",
+        "JOINT_TIME": "single_global_t",
         "R_WINDOW": list(schedule.r_window),
         "G_WINDOW": list(schedule.g_window),
         "KAPPA_R": schedule.kappa_r,
@@ -180,7 +181,7 @@ def main() -> None:
         "MATTERGEN_LOAD_EPOCH": bundle.load_epoch,
         "MATTERGEN_CHECKPOINT_SHA": bundle.checkpoint_sha256,
         "NOISE_SOURCE": PROVENANCE["noise_source"],
-        "LIE_SPLITTING": "A_first",
+        "LIE_SPLITTING": "A_first_same_t",
         "SAMPLE": sample["id"],
     }
     (out / "runtime_provenance.json").write_text(json.dumps(prov, indent=2, default=str))
@@ -209,33 +210,32 @@ def main() -> None:
                 copy=sample_d["copy"],
                 aug=aug,
             )
-            # forward CTMC on A (uniform π prior, fixed exit β)
+            # forward CTMC on A (uniform π prior, fixed exit β_R/β_G)
             traj = simulate_forward_ctmc(st0, schedule=schedule, t_start=0.0, t_end=1.0, generator=g)
-            # Geometry time t_X ~ U(0,1); assignment times from active mobility
-            t_x = noise.sample_t(1, device=device)
-            t_x_f = float(t_x.reshape(-1)[0].item())
-            t_r_f = schedule.sample_t_proportional_to_beta(kind="R", generator=g)
-            t_g_f = schedule.sample_t_proportional_to_beta(kind="G", generator=g)
-            t_r = torch.tensor([t_r_f], device=device, dtype=torch.float32)
-            t_g = torch.tensor([t_g_f], device=device, dtype=torch.float32)
-            # A-first Lie geometry: A at s < t_X
-            u = float(torch.rand((), generator=g).item())
-            t_s = u * t_x_f
-            state_s = traj.state_at(t_s)
-            state_x = traj.state_at(t_x_f)
 
-            def _corrupt(t_tensor):
-                return noise.corrupt_fixed_sample(
-                    frac_coords_0=geo["pos"],
-                    lattice_0=sample_d["cell"],
-                    num_atoms=int(sample_d["N"]),
-                    t=t_tensor,
-                    generator=g,
-                )
+            # ---- single global time t (joint state S_t = (A_t, X_t, L_t)) ----
+            # Optional focus sampling still yields ONE t, not independent t_R/t_G/t_X.
+            focus_u = float(torch.rand((), generator=g).item())
+            if focus_u < 0.34:
+                t_focus = "R"
+                t_f = schedule.sample_t_proportional_to_beta(kind="R", generator=g)
+            elif focus_u < 0.68:
+                t_focus = "G"
+                t_f = schedule.sample_t_proportional_to_beta(kind="G", generator=g)
+            else:
+                t_focus = "U"
+                t_ten = noise.sample_t(1, device=device)
+                t_f = float(t_ten.reshape(-1)[0].item())
+            t = torch.tensor([t_f], device=device, dtype=torch.float32)
+            state_t = traj.state_at(t_f)
 
-            noisy_x = _corrupt(t_x)
-            noisy_r = _corrupt(t_r)
-            noisy_g = _corrupt(t_g)
+            noisy = noise.corrupt_fixed_sample(
+                frac_coords_0=geo["pos"],
+                lattice_0=sample_d["cell"],
+                num_atoms=int(sample_d["N"]),
+                t=t,
+                generator=g,
+            )
 
             samp_aug = dict(sample_d)
             samp_aug["z"] = geo["z"]
@@ -254,9 +254,7 @@ def main() -> None:
                 }
             )
             clean_cg = build_cg(samp_aug, geo["pos"], sample_d["cell"], extra_mol=mol_extra)
-            noisy_cg_x = build_cg(samp_aug, noisy_x.frac_coords_t, noisy_x.lattice_t, extra_mol=mol_extra)
-            noisy_cg_r = build_cg(samp_aug, noisy_r.frac_coords_t, noisy_r.lattice_t, extra_mol=mol_extra)
-            noisy_cg_g = build_cg(samp_aug, noisy_g.frac_coords_t, noisy_g.lattice_t, extra_mol=mol_extra)
+            noisy_cg = build_cg(samp_aug, noisy.frac_coords_t, noisy.lattice_t, extra_mol=mol_extra)
 
             opt.zero_grad(set_to_none=True)
             losses = joint_training_step_losses(
@@ -264,14 +262,10 @@ def main() -> None:
                 loss_fn=loss_fn,
                 corruption=noise.corruption,
                 clean_cg=clean_cg,
-                noisy_cg_geom=noisy_cg_x,
-                t_geom=noisy_x.t,
-                state_for_geometry=state_s,
+                noisy_cg=noisy_cg,
+                t=noisy.t,
+                state_at_t=state_t,
                 traj=traj,
-                noisy_cg_r=noisy_cg_r,
-                t_r=t_r,
-                noisy_cg_g=noisy_cg_g,
-                t_g=t_g,
                 lambda_r=float(loss_w.get("lambda_r", 1.0)),
                 lambda_g=float(loss_w.get("lambda_g", 1.0)),
             )
@@ -280,40 +274,47 @@ def main() -> None:
             opt.step()
             n_R = sum(1 for e in traj.events if e.kind == "R")
             n_G = sum(1 for e in traj.events if e.kind == "G")
+            H_R_full = schedule.integrated_beta(0.0, 1.0, kind="R")
+            H_G_full = schedule.integrated_beta(0.0, 1.0, kind="G")
+            # segment for full forward path [0,1]; also report mass up to global_t
+            H_R_seg = H_R_full
+            H_G_seg = H_G_full
+            H_R_to_t = schedule.integrated_beta(0.0, t_f, kind="R")
+            H_G_to_t = schedule.integrated_beta(0.0, t_f, kind="G")
             row = {
                 "step": step,
-                "t_X": t_x_f,
-                "t_R": t_r_f,
-                "t_G": t_g_f,
-                "t_s": t_s,
+                "global_t": t_f,
+                "t_focus": t_focus,
                 "geometry_loss": float(losses["L_geom"].detach()),
+                "CE_R": float(losses["CE_R"].detach()),
+                "CE_G": float(losses["CE_G"].detach()),
                 "L_R": float(losses["L_R"].detach()),
                 "L_G": float(losses["L_G"].detach()),
-                "L_R_uniform": float(losses["L_R_uniform"].detach()),
-                "L_G_uniform": float(losses["L_G_uniform"].detach()),
-                "delta_L_R": float(losses["delta_L_R"].detach()),
-                "delta_L_G": float(losses["delta_L_G"].detach()),
+                "uniform_CE_R": float(losses["uniform_CE_R"].detach()),
+                "uniform_CE_G": float(losses["uniform_CE_G"].detach()),
+                "delta_CE_R": float(losses["delta_CE_R"].detach()),
+                "delta_CE_G": float(losses["delta_CE_G"].detach()),
                 "total_loss": float(losses["loss"].detach()),
                 "num_fwd_events": len(traj.events),
                 "n_R_fwd": n_R,
                 "n_G_fwd": n_G,
-                "n_R_events_loss": float(losses["n_R_events"].detach()),
-                "n_G_events_loss": float(losses["n_G_events"].detach()),
-                "H_R": schedule.integrated_beta(0.0, 1.0, kind="R"),
-                "H_G": schedule.integrated_beta(0.0, 1.0, kind="G"),
-                "expected_R": schedule.kappa_r,
-                "expected_G": schedule.kappa_g,
-                "state_s_legal": state_s.validate()["legal"],
-                "state_x_legal": state_x.validate()["legal"],
+                "n_R_events": float(losses["n_R_events"].detach()),
+                "n_G_events": float(losses["n_G_events"].detach()),
+                "num_legal_R": float(losses["num_legal_R"].detach()),
+                "num_legal_G": float(losses["num_legal_G"].detach()),
+                "H_R_full": H_R_full,
+                "H_G_full": H_G_full,
+                "H_R_segment": H_R_seg,
+                "H_G_segment": H_G_seg,
+                "expected_R_segment": H_R_seg,
+                "expected_G_segment": H_G_seg,
+                "H_R_to_t": H_R_to_t,
+                "H_G_to_t": H_G_to_t,
+                "beta_R_t": float(schedule.beta_r(t_f).item()),
+                "beta_G_t": float(schedule.beta_g(t_f).item()),
+                "state_t_legal": state_t.validate()["legal"],
             }
-            for k in (
-                "diag_num_R_moves",
-                "diag_num_G_moves",
-                "diag_logit_mean_R",
-                "diag_logit_mean_G",
-                "diag_entropy_R",
-                "diag_entropy_G",
-            ):
+            for k in ("entropy_R", "entropy_G", "logit_mean_R", "logit_mean_G"):
                 if k in losses:
                     row[k] = float(losses[k].detach())
             stream.write(json.dumps(row) + "\n")

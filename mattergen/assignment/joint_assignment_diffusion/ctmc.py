@@ -41,13 +41,15 @@ def simulate_forward_ctmc(
     generator: torch.Generator | None = None,
     max_events: int = 100_000,
 ) -> CTMCTrajectory:
-    """Gillespie CTMC with fixed total exit rates β_a(t).
+    """Gillespie CTMC with fixed total exit rates β_a(t) for R and G.
 
     Forward proposal is uniform on legal moves of each kind:
       r_m^a = β_a(t) / |M_a|   ⇒   Σ_m r_m^a = β_a(t)
-    (matches reverse training of π; forward prior uses π_uniform).
 
-    Time-dependent β uses integrated-hazard-aware piecewise knots at window edges.
+    Event times use **forward** integrated hazard:
+      ∫_t^{t_ev} λ(τ) dτ = E,  E ~ Exp(1),
+    λ = 1_{|M_R|>0} β_R + 1_{|M_G|>0} β_G.
+    Both R and G share the same non-homogeneous mechanism (no left-endpoint freeze).
     """
     if t_end <= t_start:
         raise ValueError("t_end must exceed t_start")
@@ -67,57 +69,45 @@ def simulate_forward_ctmc(
         moves = enumerate_legal_moves(state)
         r_on = len(moves["R"]) > 0
         g_on = len(moves["G"]) > 0
-        beta_r = float(schedule.beta_r(t).item()) if r_on else 0.0
-        beta_g = float(schedule.beta_g(t).item()) if g_on else 0.0
-        total = 0.0
-        rates: list[tuple[LegalMove, float]] = []
-        for kind, beta, pool in (("R", beta_r, moves["R"]), ("G", beta_g, moves["G"])):
-            if beta <= 0.0 or not pool:
-                continue
-            r_each = beta / float(len(pool))
-            for m in pool:
-                rates.append((m, r_each))
-                total += r_each
+        # Waiting time uses integrated λ over the knot segment (not β frozen at left endpoint).
+        t_next_knot = schedule.next_mobility_time(t, t_end)
+        # Avoid zero-length segments at exact knots
+        if t_next_knot <= t + 1e-15:
+            t_next_knot = min(t + 1e-6, t_end)
 
-        if total <= 1e-30:
-            # jump to next mobility opening or end (do not freeze forever)
-            next_candidates = [t_end]
-            for lo, hi in (schedule.r_window, schedule.g_window):
-                if t < lo < t_end:
-                    next_candidates.append(lo + 1e-9)
-            next_t = min(next_candidates)
-            if next_t <= t + 1e-12:
-                break
-            t = min(next_t, t_end)
-            times.append(t)
-            states.append(state.clone())
-            continue
-
-        # non-homogeneous: use integrated hazard over [t, next_knot]
-        knots = schedule.schedule_knots(t, t_end) + [t_end]
-        t_next_knot = min(k for k in knots if k > t + 1e-15)
-        # Between knots, β varies continuously; invert cumulative hazard with on-flags
-        E = -float(torch.log(torch.tensor(max(_rand(), 1e-12))).item())
         H_seg = schedule.integrated_hazard_total(t, t_next_knot, r_on=r_on, g_on=g_on)
+        if H_seg <= 1e-30:
+            # No R/G mobility mass on (t, knot] (locked or empty legal pools)
+            if t_next_knot >= t_end - 1e-15:
+                break
+            t = t_next_knot
+            times.append(t)
+            states.append(state.clone())
+            continue
+
+        E = -float(torch.log(torch.tensor(max(_rand(), 1e-12))).item())
         if E > H_seg + 1e-12:
-            # no event before next knot
+            # No event before next knot
             t = t_next_knot
             times.append(t)
             states.append(state.clone())
             continue
-        t_ev = schedule.inverse_integrated_hazard(
-            t_next_knot, E, t_low=t, r_on=r_on, g_on=g_on
+
+        # Forward inverse: ∫_t^{t_ev} λ = E  (NOT reverse ∫_{t_ev}^{knot})
+        t_ev = schedule.inverse_integrated_hazard_forward(
+            t, E, t_high=t_next_knot, r_on=r_on, g_on=g_on
         )
-        if t_ev is None or t_ev <= t + 1e-15:
+        if t_ev is None:
             t = t_next_knot
             times.append(t)
             states.append(state.clone())
             continue
-        t = float(t_ev)
-        # Recompute rates at event time for kind choice (β(t) may differ)
+        t = float(min(max(t_ev, t + 1e-15), t_next_knot))
+
+        # Kind / move choice at event time with current legal pools
         beta_r = float(schedule.beta_r(t).item()) if r_on else 0.0
         beta_g = float(schedule.beta_g(t).item()) if g_on else 0.0
-        rates = []
+        rates: list[tuple[LegalMove, float]] = []
         total = 0.0
         for kind, beta, pool in (("R", beta_r, moves["R"]), ("G", beta_g, moves["G"])):
             if beta <= 0.0 or not pool:
@@ -127,9 +117,11 @@ def simulate_forward_ctmc(
                 rates.append((m, r_each))
                 total += r_each
         if total <= 1e-30:
+            # Landed on a β≈0 edge; advance without jump
             times.append(t)
             states.append(state.clone())
             continue
+
         pick = _rand() * total
         acc = 0.0
         chosen: LegalMove | None = None

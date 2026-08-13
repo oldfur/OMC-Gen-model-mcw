@@ -107,6 +107,31 @@ def test_forward_ctmc_stays_legal_and_respects_window():
             assert sch.is_g_active(e.time)
 
 
+def test_forward_ctmc_produces_g_and_r_events():
+    """G and R share integrated-hazard plumbing; both should fire under κ>0."""
+    st, _, _ = _toy_state()
+    sch = AsyncJumpSchedule(r_window=(0.60, 0.95), g_window=(0.35, 0.75), kappa_r=4.0, kappa_g=6.0)
+    n_R = n_G = 0
+    for seed in range(8):
+        traj = simulate_forward_ctmc(st, schedule=sch, generator=torch.Generator().manual_seed(seed))
+        n_R += sum(1 for e in traj.events if e.kind == "R")
+        n_G += sum(1 for e in traj.events if e.kind == "G")
+    assert n_G > 0, "G events must not systematically vanish"
+    assert n_R > 0, "R events must not systematically vanish"
+
+
+def test_forward_inverse_hazard_matches_integral():
+    sch = AsyncJumpSchedule(r_window=(0.60, 0.95), g_window=(0.35, 0.75), kappa_r=4.0, kappa_g=6.0)
+    t0, t1 = 0.40, 0.70
+    H = sch.integrated_hazard_total(t0, t1, r_on=False, g_on=True)
+    assert H > 0
+    # mid-hazard event time
+    tau = sch.inverse_integrated_hazard_forward(t0, 0.5 * H, t_high=t1, r_on=False, g_on=True)
+    assert tau is not None
+    H_left = sch.integrated_hazard_total(t0, float(tau), r_on=False, g_on=True)
+    assert abs(H_left - 0.5 * H) < 1e-3
+
+
 def test_uniform_prior_legal():
     st, partition, role_z = _toy_state()
     prior = sample_uniform_legal_prior(

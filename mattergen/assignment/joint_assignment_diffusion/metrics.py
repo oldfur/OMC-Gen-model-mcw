@@ -1,4 +1,4 @@
-"""J1 validation metrics: legality, mobility windows, copy metrics."""
+"""J1 validation metrics: legality, mobility windows, segment hazard, copy metrics."""
 from __future__ import annotations
 
 from typing import Any
@@ -37,7 +37,6 @@ def lock_schedule_checks(traj: CTMCTrajectory, schedule: AsyncJumpSchedule) -> d
     return {
         "r_jumps_outside_window": r_outside,
         "g_jumps_outside_window": g_outside,
-        # legacy keys (eval scripts / terminal compatibility)
         "r_jumps_at_or_below_lock": r_outside,
         "g_jumps_at_or_below_lock": g_outside,
         "r_lock_ok": r_outside == 0,
@@ -52,19 +51,38 @@ def lock_schedule_checks(traj: CTMCTrajectory, schedule: AsyncJumpSchedule) -> d
 def jump_budget_diagnostics(
     traj: CTMCTrajectory,
     schedule: AsyncJumpSchedule,
+    *,
+    t_start: float = 0.0,
+    t_end: float = 1.0,
 ) -> dict[str, Any]:
+    """Compare actual jumps to **segment** integrated hazard H_a(s,t)=∫_s^t β_a.
+
+    Also reports full-window integrals for reference (κ when legal always exist).
+    """
     n_R = sum(1 for e in traj.events if e.kind == "R")
     n_G = sum(1 for e in traj.events if e.kind == "G")
-    exp = schedule.expected_jump_budget()
+    H_R_full = schedule.integrated_beta(0.0, 1.0, kind="R")
+    H_G_full = schedule.integrated_beta(0.0, 1.0, kind="G")
+    H_R_seg = schedule.integrated_beta(t_start, t_end, kind="R")
+    H_G_seg = schedule.integrated_beta(t_start, t_end, kind="G")
     return {
         "n_R": n_R,
         "n_G": n_G,
-        "expected_R": exp["R"],
-        "expected_G": exp["G"],
-        "H_R": schedule.integrated_beta(0.0, 1.0, kind="R"),
-        "H_G": schedule.integrated_beta(0.0, 1.0, kind="G"),
-        "ratio_R": n_R / max(exp["R"], 1e-8),
-        "ratio_G": n_G / max(exp["G"], 1e-8),
+        "H_R_full": H_R_full,
+        "H_G_full": H_G_full,
+        "H_R_segment": H_R_seg,
+        "H_G_segment": H_G_seg,
+        "expected_R_segment": H_R_seg,
+        "expected_G_segment": H_G_seg,
+        "expected_R": schedule.kappa_r,
+        "expected_G": schedule.kappa_g,
+        "ratio_R_vs_segment": n_R / max(H_R_seg, 1e-8),
+        "ratio_G_vs_segment": n_G / max(H_G_seg, 1e-8),
+        # legacy keys (full-window)
+        "H_R": H_R_full,
+        "H_G": H_G_full,
+        "ratio_R": n_R / max(schedule.kappa_r, 1e-8),
+        "ratio_G": n_G / max(schedule.kappa_g, 1e-8),
     }
 
 

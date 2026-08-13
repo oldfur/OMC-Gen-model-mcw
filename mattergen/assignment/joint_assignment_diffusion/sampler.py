@@ -94,7 +94,9 @@ def _gillespie_step_a_integrated(
         mass_g = beta_g if pi["G"] else 0.0
         tot = mass_r + mass_g
         if tot <= 1e-30:
-            # β≈0 at this τ (window edge); continue reverse without jump
+            # β≈0 at this τ (window edge); step slightly earlier and continue
+            # (must decrease cur_t or reverse loop can stall)
+            cur_t = max(t_target, cur_t - 1e-6)
             continue
         pick = _rand(generator) * tot
         if pick <= mass_r and pi["R"]:
@@ -103,26 +105,31 @@ def _gillespie_step_a_integrated(
         else:
             kind = "G"
             pool = pi["G"]
+            if not pool and pi["R"]:
+                kind = "R"
+                pool = pi["R"]
+        if not pool:
+            cur_t = max(t_target, cur_t - 1e-6)
+            continue
         # Sample move ~ π
         u = _rand(generator)
         acc = 0.0
         chosen_m: LegalMove | None = None
-        chosen_p = None
         for m, p in pool:
             acc += float(p.detach().item())
             if u <= acc:
                 chosen_m = m
-                chosen_p = p
                 break
         if chosen_m is None:
             chosen_m = pool[-1][0]
-            chosen_p = pool[-1][1]
         st = apply_move(st, chosen_m)
         events.append(CTMCEvent(time=cur_t, kind=kind, i=chosen_m.i, j=chosen_m.j))
         n_ev += 1
         if not st.validate()["legal"]:
             raise RuntimeError("sampler left legal assignment space")
     diag["n_events_macro"] = len(events)
+    diag["n_R_macro"] = sum(1 for e in events if e.kind == "R")
+    diag["n_G_macro"] = sum(1 for e in events if e.kind == "G")
     return st, events, diag
 
 
@@ -251,8 +258,10 @@ def sample_joint_prior_and_trajectory(
             "n": len(events),
             "n_R": sum(1 for e in events if e.kind == "R"),
             "n_G": sum(1 for e in events if e.kind == "G"),
-            "H_R": a_diag.get("H_R_macro", 0.0),
-            "H_G": a_diag.get("H_G_macro", 0.0),
+            "H_R_segment": a_diag.get("H_R_macro", 0.0),
+            "H_G_segment": a_diag.get("H_G_macro", 0.0),
+            "expected_R_segment": a_diag.get("H_R_macro", 0.0),
+            "expected_G_segment": a_diag.get("H_G_macro", 0.0),
         }
         traj.diagnostics["macro_H"].append(a_diag)
 
