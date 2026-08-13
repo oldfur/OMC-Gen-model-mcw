@@ -259,9 +259,10 @@ def aggregate_event_bins(records: list[dict[str, Any]]) -> dict[str, Any]:
         by[f"{kind}:{name}"].append(rec)
 
     def _m(recs, key):
-        if not recs:
+        xs = [float(r[key]) for r in recs if r.get(key) is not None]
+        if not xs:
             return 0.0
-        return float(sum(float(r[key]) for r in recs) / len(recs))
+        return float(sum(xs) / len(xs))
 
     out: dict[str, Any] = {}
     for key, recs in sorted(by.items()):

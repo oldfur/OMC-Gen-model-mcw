@@ -437,12 +437,7 @@ def main() -> None:
             if step % log_every == 0 or step + 1 == steps:
                 print(json.dumps(row), flush=True)
 
-    (out / "event_bin_summary.json").write_text(json.dumps(aggregate_event_bins(event_records), indent=2))
-    (out / "g_teacher_bin_summary.json").write_text(json.dumps(aggregate_g_teacher_bins(event_records), indent=2))
-    with (out / "event_bin_trace.jsonl").open("w") as ef:
-        for rec in event_records:
-            ef.write(json.dumps(rec) + "\n")
-
+    # Save weights first so a diagnostics dump cannot lose a finished run.
     torch.save(
         {
             "joint_state_dict": model.state_dict(),
@@ -456,6 +451,14 @@ def main() -> None:
         {"joint_state_dict": model.state_dict(), "provenance": prov},
         out / "best_checkpoint.pt",
     )
+    try:
+        (out / "event_bin_summary.json").write_text(json.dumps(aggregate_event_bins(event_records), indent=2))
+        (out / "g_teacher_bin_summary.json").write_text(json.dumps(aggregate_g_teacher_bins(event_records), indent=2))
+        with (out / "event_bin_trace.jsonl").open("w") as ef:
+            for rec in event_records:
+                ef.write(json.dumps(rec) + "\n")
+    except Exception as exc:
+        print(json.dumps({"event": "j1_diag_dump_failed", "error": str(exc)}), flush=True)
     print(json.dumps({"event": "j1_train_done", "output": str(out), "n_event_targets": len(event_records)}), flush=True)
 
 
