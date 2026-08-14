@@ -22,7 +22,8 @@ joint_j1:
   g_teacher_temperature: 0.02
   # J1.3-B: mean | orbit_slot | orbit_slot_geometry | template_counterfactual
   g_copy_context_mode: template_counterfactual
-  g_relation_detach_trunk: true
+  # B3 detach=true | B4 coupled mirror: false (only experimental variable)
+  g_relation_detach_trunk: false
 
   loss:
     lambda_r: 1.0

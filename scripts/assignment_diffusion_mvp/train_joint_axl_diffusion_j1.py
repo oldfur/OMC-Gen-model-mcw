@@ -18,11 +18,15 @@ if str(ROOT) not in sys.path:
 from mattergen.assignment.global_copy_assembly.orbit_membership import build_orbit_partition
 from mattergen.assignment.joint_assignment_diffusion.ctmc import simulate_forward_ctmc
 from mattergen.assignment.joint_assignment_diffusion.joint_model import JointAXLModel
+from mattergen.assignment.joint_assignment_diffusion.legal_moves import enumerate_r_moves
 from mattergen.assignment.joint_assignment_diffusion.losses import (
+    aggregate_r_forgetting,
+    coupled_trunk_interference_audit,
     event_conditioned_assignment_ce,
     event_conditioned_g_teacher_ce,
     geometry_step_loss,
     isolation_grad_norms,
+    summarize_interference,
 )
 from mattergen.assignment.soft_c_geometry_feedback_n2.geometry_loss import mattergen_geometry_loss
 from mattergen.assignment.joint_assignment_diffusion.reverse_eval import (
@@ -194,6 +198,8 @@ def main() -> None:
         "J1_3A": "improvement_weighted_g_teacher",
         "J1_3B2": "candidate_to_copy_pbc_geometry",
         "J1_3B3": "template_counterfactual_g_policy",
+        "J1_3B4": "rg_coupled_gradient_interference_audit",
+        "B4_MIRROR_OF": "38bfa7b590fcda1ee1dfce4b01b70e12d974be78",
         "G_SUPERVISION": str((cfg.get("g_supervision") or "improvement_weighted")),
         "G_TEACHER_TEMPERATURE": float((cfg.get("g_teacher_temperature") or 0.02)),
         "G_COPY_CONTEXT_MODE": str(cfg.get("g_copy_context_mode") or "template_counterfactual"),
@@ -213,6 +219,47 @@ def main() -> None:
     }
     (out / "runtime_provenance.json").write_text(json.dumps(prov, indent=2, default=str))
     print(json.dumps({"event": "j1_start", **prov}), flush=True)
+    b3_ref = {
+        "g_copy_context_mode": "template_counterfactual",
+        "g_supervision": "improvement_weighted",
+        "g_teacher_temperature": 0.02,
+        "g_relation_detach_trunk": True,
+        "steps": 1000,
+        "seed": 17,
+        "lambda_r": 1.0,
+        "lambda_g": 1.0,
+        "lr_pretrained": 1.0e-5,
+        "lr_new": 1.0e-4,
+        "kappa_r": 4.0,
+        "kappa_g": 6.0,
+    }
+    b4_now = {
+        "g_copy_context_mode": g_ctx,
+        "g_supervision": str((cfg.get("g_supervision") or "improvement_weighted")),
+        "g_teacher_temperature": float(cfg.get("g_teacher_temperature") or 0.02),
+        "g_relation_detach_trunk": g_detach,
+        "steps": int(args.steps or cfg.get("steps", 1000)),
+        "seed": int(cfg.get("seed", 17)),
+        "lambda_r": float((cfg.get("loss") or {}).get("lambda_r", 1.0)),
+        "lambda_g": float((cfg.get("loss") or {}).get("lambda_g", 1.0)),
+        "lr_pretrained": float(opt_cfg.get("lr_pretrained", 1e-5)),
+        "lr_new": float(opt_cfg.get("lr_new", 1e-4)),
+        "kappa_r": float(schedule.kappa_r),
+        "kappa_g": float(schedule.kappa_g),
+    }
+    flipped = {k: {"B3": b3_ref[k], "B4": b4_now[k]} for k in b3_ref if b3_ref[k] != b4_now[k]}
+    print(
+        json.dumps(
+            {
+                "event": "b3_b4_equality_check",
+                "only_allowed_flip": "g_relation_detach_trunk",
+                "flipped": flipped,
+                "equal_except_detach": set(flipped.keys()) <= {"g_relation_detach_trunk"},
+            },
+            default=str,
+        ),
+        flush=True,
+    )
 
     clean_state0 = a_from_role_and_copy(
         role=sample_d["role"],
@@ -228,6 +275,52 @@ def main() -> None:
         raise ValueError(f"unknown g_supervision={g_sup}")
     g_temp = float(cfg.get("g_teacher_temperature") or 0.02)
     event_records: list[dict] = []
+    interference_rows: list[dict] = []
+    param_lrs = {id(p): float(pg["lr"]) for pg in opt.param_groups for p in pg["params"]}
+    # Fixed R probe uses an independent RNG so seed-17 training order is unchanged.
+    probe_gen = torch.Generator(device="cpu")
+    probe_gen.manual_seed(int(cfg.get("seed", 17)) + 1_000_003)
+    r_moves0 = enumerate_r_moves(clean_state0)
+    r_probe: dict | None = None
+    if r_moves0:
+        rm0 = r_moves0[0]
+        t_probe = torch.tensor([0.75], device=device, dtype=torch.float32)
+        noisy_probe = noise.corrupt_fixed_sample(
+            frac_coords_0=sample_d["pos"],
+            lattice_0=sample_d["cell"],
+            num_atoms=int(sample_d["N"]),
+            t=t_probe,
+            generator=probe_gen,
+        )
+        mol_probe = build_mol_conditioning_from_sample(
+            {
+                "z": sample_d["z"],
+                "role": sample_d["role"],
+                "copy": sample_d["copy"],
+                "role_edge_index": sample_d["role_edge_index"],
+                "role_bond_type": sample_d["role_bond_type"],
+            }
+        )
+        r_probe = {
+            "chemgraph_t": build_cg(sample_d, noisy_probe.frac_coords_t, noisy_probe.lattice_t, extra_mol=mol_probe),
+            "t": noisy_probe.t,
+            "state": clean_state0,
+            "i": rm0.i,
+            "j": rm0.j,
+            "tau": 0.75,
+        }
+        print(
+            json.dumps(
+                {
+                    "event": "b4_fixed_r_probe",
+                    "i": rm0.i,
+                    "j": rm0.j,
+                    "tau": 0.75,
+                    "n_legal_R_clean": len(r_moves0),
+                }
+            ),
+            flush=True,
+        )
     with (out / "training_trace.jsonl").open("w", buffering=1) as stream:
         for step in range(steps):
             # symmetry augmentation
@@ -418,6 +511,15 @@ def main() -> None:
                     "grad_norm_G_specific_from_LG",
                     "grad_norm_shared_trunk_from_LG",
                     "grad_norm_R_head_from_LG",
+                    "cos_RG",
+                    "D_G_over_R",
+                    "norm_g_R",
+                    "norm_g_G",
+                    "destructive_dominant",
+                    "delta_G_LR",
+                    "delta_G_LR_linear",
+                    "L_R_probe_pre",
+                    "L_R_probe_post",
                 ):
                     if k in ev_diag and ev_diag[k] is not None:
                         v = ev_diag[k]
@@ -442,8 +544,20 @@ def main() -> None:
             if picked is not None and picked.kind == "G":
                 iso = isolation_grad_norms(model, ce_g)
                 ev_diag.update(iso)
+                if r_probe is not None:
+                    inter = coupled_trunk_interference_audit(
+                        model=model,
+                        ce_g=ce_g,
+                        probe=r_probe,
+                        param_lrs=param_lrs,
+                    )
+                    ev_diag.update(inter)
+                    interference_rows.append({"step": step, **inter})
                 if event_records:
-                    event_records[-1].update({k: float(v) for k, v in iso.items()})
+                    extra = {k: float(v) for k, v in iso.items()}
+                    if r_probe is not None:
+                        extra.update({k: float(ev_diag[k]) for k in inter})
+                    event_records[-1].update(extra)
             total = L_geom + lam_r * ce_r + lam_g * ce_g
             total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -491,6 +605,10 @@ def main() -> None:
                 "grad_norm_R_head_from_LG": float(ev_diag.get("grad_norm_R_head_from_LG", 0.0)) if ev_diag else 0.0,
                 "spearman_logit_vs_utility": float(ev_diag.get("spearman_logit_vs_utility", 0.0)) if ev_diag else 0.0,
                 "spearman_deltaS_vs_utility": float(ev_diag.get("spearman_deltaS_vs_utility", 0.0)) if ev_diag else 0.0,
+                "cos_RG": float(ev_diag.get("cos_RG", 0.0)) if ev_diag else 0.0,
+                "D_G_over_R": float(ev_diag.get("D_G_over_R", 0.0)) if ev_diag else 0.0,
+                "delta_G_LR": float(ev_diag.get("delta_G_LR", 0.0)) if ev_diag else 0.0,
+                "destructive_dominant": float(ev_diag.get("destructive_dominant", 0.0)) if ev_diag else 0.0,
             }
             stream.write(json.dumps(row) + "\n")
             if step % log_every == 0 or step + 1 == steps:
@@ -513,9 +631,24 @@ def main() -> None:
     try:
         (out / "event_bin_summary.json").write_text(json.dumps(aggregate_event_bins(event_records), indent=2))
         (out / "g_teacher_bin_summary.json").write_text(json.dumps(aggregate_g_teacher_bins(event_records), indent=2))
+        forget = aggregate_r_forgetting(event_records)
+        inter_sum = summarize_interference(interference_rows)
+        (out / "r_forgetting_summary.json").write_text(json.dumps(forget, indent=2))
+        (out / "rg_interference_summary.json").write_text(
+            json.dumps(
+                {
+                    "g_relation_detach_trunk": g_detach,
+                    "mirror_of": "38bfa7b590fcda1ee1dfce4b01b70e12d974be78",
+                    "interference": inter_sum,
+                    "r_forgetting": forget,
+                },
+                indent=2,
+            )
+        )
         with (out / "event_bin_trace.jsonl").open("w") as ef:
             for rec in event_records:
                 ef.write(json.dumps(rec) + "\n")
+        print(json.dumps({"event": "b4_audit_summary", "detach": g_detach, **inter_sum.get("all", {}), **forget}), flush=True)
     except Exception as exc:
         print(json.dumps({"event": "j1_diag_dump_failed", "error": str(exc)}), flush=True)
     print(json.dumps({"event": "j1_train_done", "output": str(out), "n_event_targets": len(event_records)}), flush=True)

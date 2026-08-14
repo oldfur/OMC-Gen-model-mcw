@@ -749,3 +749,43 @@ def test_spearman_tied_ranks():
     xt = torch.tensor([1.0, 1.0, 2.0])
     yt = torch.tensor([3.0, 3.0, 9.0])
     assert spearman_tied(xt, yt) > 0.9
+
+
+def test_trunk_rg_interference_metrics_and_forgetting():
+    from mattergen.assignment.joint_assignment_diffusion.losses import (
+        aggregate_r_forgetting,
+        flatten_param_grads,
+        summarize_interference,
+        trunk_rg_interference_metrics,
+    )
+
+    p = torch.zeros(3, requires_grad=False)
+    g_r = flatten_param_grads([p], [torch.tensor([1.0, 0.0, 0.0])])
+    g_g_anti = flatten_param_grads([p], [torch.tensor([-2.0, 0.0, 0.0])])
+    m = trunk_rg_interference_metrics(g_r, g_g_anti)
+    assert m["cos_RG"] < -0.99
+    assert m["D_G_over_R"] > 1.0
+    assert m["destructive_dominant"] == 1.0
+    g_g_al = flatten_param_grads([p], [torch.tensor([0.5, 0.0, 0.0])])
+    m2 = trunk_rg_interference_metrics(g_r, g_g_al)
+    assert m2["cos_RG"] > 0.99
+    assert m2["destructive_dominant"] == 0.0
+
+    recs = [
+        {"kind": "R", "delta_CE": -0.5, "top1": 0.4},
+        {"kind": "R", "delta_CE": -1.0, "top1": 0.6},
+        {"kind": "R", "delta_CE": -0.2, "top1": 0.3},
+        {"kind": "G", "delta_CE": 0.0, "top1": 0.0},
+    ]
+    fr = aggregate_r_forgetting(recs)
+    assert abs(fr["best_delta_CE_R"] + 1.0) < 1e-9
+    assert fr["forgetting_delta_CE_R"] > 0.0
+    inter = summarize_interference(
+        [
+            {"step": 10, "cos_RG": -0.5, "D_G_over_R": 2.0, "destructive_dominant": 1.0, "delta_G_LR": 0.1, "norm_g_G": 1.0, "norm_g_R": 0.5},
+            {"step": 900, "cos_RG": 0.1, "D_G_over_R": 0.5, "destructive_dominant": 0.0, "delta_G_LR": -0.02, "norm_g_G": 0.2, "norm_g_R": 0.4},
+        ]
+    )
+    assert inter["all"]["n"] == 2
+    assert inter["early"]["n"] == 1
+    assert inter["late"]["n"] == 1

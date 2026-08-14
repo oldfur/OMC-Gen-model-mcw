@@ -129,6 +129,241 @@ def isolation_grad_norms(model, ce_g: torch.Tensor) -> dict[str, float]:
     return out
 
 
+def flatten_param_grads(params, grads) -> torch.Tensor:
+    """Concatenate per-parameter grads; unused → zeros of the same numel."""
+    chunks = []
+    for p, g in zip(params, grads):
+        if g is None:
+            chunks.append(torch.zeros(p.numel(), device=p.device, dtype=torch.float32))
+        else:
+            chunks.append(g.detach().float().reshape(-1).cpu())
+    if not chunks:
+        return torch.zeros(0)
+    return torch.cat(chunks)
+
+
+def trunk_rg_interference_metrics(
+    g_r: torch.Tensor,
+    g_g: torch.Tensor,
+    *,
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    """cos_RG and D_G/R on flattened shared-trunk gradients."""
+    if g_r.numel() == 0 or g_g.numel() == 0:
+        return {
+            "cos_RG": 0.0,
+            "D_G_over_R": 0.0,
+            "norm_g_R": 0.0,
+            "norm_g_G": 0.0,
+            "destructive_dominant": 0.0,
+        }
+    nr = float(g_r.norm())
+    ng = float(g_g.norm())
+    cos = float((g_r * g_g).sum() / (nr * ng + eps))
+    dgr = ng / (nr + eps)
+    return {
+        "cos_RG": cos,
+        "D_G_over_R": dgr,
+        "norm_g_R": nr,
+        "norm_g_G": ng,
+        "destructive_dominant": 1.0 if (cos < 0.0 and dgr > 1.0) else 0.0,
+    }
+
+
+def _snapshot_named_buffers(model) -> dict[str, torch.Tensor]:
+    return {n: b.detach().clone() for n, b in model.named_buffers()}
+
+
+def _restore_named_buffers(model, snap: dict[str, torch.Tensor]) -> None:
+    with torch.no_grad():
+        for n, b in model.named_buffers():
+            if n in snap:
+                b.copy_(snap[n])
+
+
+def coupled_trunk_interference_audit(
+    *,
+    model,
+    ce_g: torch.Tensor,
+    probe: dict[str, Any],
+    param_lrs: dict[int, float],
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    """Shared-trunk R vs G interference on a fixed R probe.
+
+    Does not write ``.grad``, does not step the optimizer, and restores
+    parameter data + buffers so the training trajectory is unchanged.
+    ``Δ_G L_R`` is an isolated SGD step ``θ_s ← θ_s − lr ⊙ g_G`` (no Adam
+    moments, no L_geom) so damage is attributable to L_G coupling.
+    """
+    empty = {
+        "cos_RG": 0.0,
+        "D_G_over_R": 0.0,
+        "norm_g_R": 0.0,
+        "norm_g_G": 0.0,
+        "destructive_dominant": 0.0,
+        "delta_G_LR": 0.0,
+        "delta_G_LR_linear": 0.0,
+        "L_R_probe_pre": 0.0,
+        "L_R_probe_post": 0.0,
+    }
+    if not (torch.is_tensor(ce_g) and ce_g.requires_grad and ce_g.grad_fn is not None):
+        return empty
+    if not probe:
+        return empty
+    trunk = [p for p in model.shared_trunk_parameters() if p.requires_grad]
+    if not trunk:
+        return empty
+
+    g_g_list = torch.autograd.grad(ce_g, trunk, retain_graph=True, allow_unused=True)
+    g_g = flatten_param_grads(trunk, g_g_list)
+
+    was_training = model.training
+    buf_snap = _snapshot_named_buffers(model)
+    backups = [p.detach().clone() for p in trunk]
+    try:
+        model.eval()
+        r_pre = event_conditioned_assignment_ce(
+            model=model,
+            chemgraph_t=probe["chemgraph_t"],
+            t=probe["t"],
+            state_after=probe["state"],
+            kind="R",
+            i=int(probe["i"]),
+            j=int(probe["j"]),
+        )
+        ce_r = r_pre["CE"]
+        l_pre = float(ce_r.detach())
+        if torch.is_tensor(ce_r) and ce_r.requires_grad and ce_r.grad_fn is not None:
+            g_r_list = torch.autograd.grad(ce_r, trunk, retain_graph=False, allow_unused=True)
+        else:
+            g_r_list = [None] * len(trunk)
+        g_r = flatten_param_grads(trunk, g_r_list)
+        mets = trunk_rg_interference_metrics(g_r, g_g, eps=eps)
+
+        # first-order: ⟨g_R, −lr ⊙ g_G⟩
+        lin = 0.0
+        with torch.no_grad():
+            for p, gr, gg in zip(trunk, g_r_list, g_g_list):
+                lr = float(param_lrs.get(id(p), 0.0))
+                if gr is None or gg is None or lr == 0.0:
+                    continue
+                lin += float((-lr) * (gr.detach().float() * gg.detach().float()).sum())
+
+        with torch.no_grad():
+            for p, gg in zip(trunk, g_g_list):
+                lr = float(param_lrs.get(id(p), 0.0))
+                if gg is None or lr == 0.0:
+                    continue
+                p.add_(gg.detach(), alpha=-lr)
+
+        r_post = event_conditioned_assignment_ce(
+            model=model,
+            chemgraph_t=probe["chemgraph_t"],
+            t=probe["t"],
+            state_after=probe["state"],
+            kind="R",
+            i=int(probe["i"]),
+            j=int(probe["j"]),
+        )
+        l_post = float(r_post["CE"].detach())
+        mets.update(
+            {
+                "delta_G_LR": l_post - l_pre,
+                "delta_G_LR_linear": lin,
+                "L_R_probe_pre": l_pre,
+                "L_R_probe_post": l_post,
+            }
+        )
+        return mets
+    finally:
+        with torch.no_grad():
+            for p, b in zip(trunk, backups):
+                p.copy_(b)
+        _restore_named_buffers(model, buf_snap)
+        model.train(was_training)
+
+
+def aggregate_r_forgetting(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Orbit-invariant R CE / top1 forgetting: final − best (loss convention)."""
+    rrecs = [r for r in records if r.get("kind") == "R"]
+    if not rrecs:
+        return {"n": 0, "best_delta_CE_R": 0.0, "final_delta_CE_R": 0.0, "forgetting_delta_CE_R": 0.0}
+
+    def _win(recs: list[dict], k: str, default: float = 0.0) -> float:
+        xs = [float(r.get(k, default)) for r in recs if r.get(k) is not None]
+        return float(sum(xs) / len(xs)) if xs else default
+
+    dces = [float(r.get("delta_CE", 0.0)) for r in rrecs]
+    top1s = [float(r.get("top1", 0.0)) for r in rrecs]
+    best_dce = min(dces)
+    best_top1 = max(top1s)
+    # final = last 100 R events (or all if fewer)
+    tail = rrecs[-100:] if len(rrecs) >= 20 else rrecs
+    final_dce = _win(tail, "delta_CE")
+    final_top1 = _win(tail, "top1")
+    # running-best prefix then last-window
+    run_best = dces[0]
+    run_bests = []
+    for v in dces:
+        run_best = min(run_best, v)
+        run_bests.append(run_best)
+    return {
+        "n": len(rrecs),
+        "n_final_window": len(tail),
+        "best_delta_CE_R": best_dce,
+        "final_delta_CE_R": final_dce,
+        "forgetting_delta_CE_R": final_dce - best_dce,
+        "best_top1_R": best_top1,
+        "final_top1_R": final_top1,
+        "forgetting_top1_R": best_top1 - final_top1,
+        "overall_delta_CE_R": _win(rrecs, "delta_CE"),
+        "overall_top1_R": _win(rrecs, "top1"),
+        "last100_delta_CE_R": final_dce,
+        "last100_top1_R": final_top1,
+    }
+
+
+def summarize_interference(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-G-step interference rows (early <200, late ≥800)."""
+    if not rows:
+        return {"n": 0}
+
+    def _agg(recs: list[dict]) -> dict[str, Any]:
+        if not recs:
+            return {"n": 0}
+        cos = [float(r["cos_RG"]) for r in recs]
+        dgr = [float(r["D_G_over_R"]) for r in recs]
+        dmg = [float(r["delta_G_LR"]) for r in recs]
+        cos_s = sorted(cos)
+        dmg_s = sorted(dmg)
+        mid = len(cos_s) // 2
+        med_cos = cos_s[mid] if len(cos_s) % 2 == 1 else 0.5 * (cos_s[mid - 1] + cos_s[mid])
+        mid_d = len(dmg_s) // 2
+        med_dmg = dmg_s[mid_d] if len(dmg_s) % 2 == 1 else 0.5 * (dmg_s[mid_d - 1] + dmg_s[mid_d])
+        n = float(len(recs))
+        return {
+            "n": len(recs),
+            "cos_RG_mean": sum(cos) / n,
+            "cos_RG_median": med_cos,
+            "cos_RG_negative_fraction": sum(1.0 for c in cos if c < 0.0) / n,
+            "cos_RG_lt_m0_2_fraction": sum(1.0 for c in cos if c < -0.2) / n,
+            "D_G_over_R_mean": sum(dgr) / n,
+            "D_G_over_R_median": sorted(dgr)[len(dgr) // 2],
+            "destructive_dominant_fraction": sum(float(r.get("destructive_dominant", 0.0)) for r in recs) / n,
+            "delta_G_LR_mean": sum(dmg) / n,
+            "delta_G_LR_median": med_dmg,
+            "delta_G_LR_positive_fraction": sum(1.0 for d in dmg if d > 0.0) / n,
+            "cumulative_delta_G_LR": sum(dmg),
+            "norm_g_G_mean": sum(float(r.get("norm_g_G", 0.0)) for r in recs) / n,
+            "norm_g_R_mean": sum(float(r.get("norm_g_R", 0.0)) for r in recs) / n,
+        }
+
+    early = [r for r in rows if int(r.get("step", 0)) < 200]
+    late = [r for r in rows if int(r.get("step", 0)) >= 800]
+    return {"all": _agg(rows), "early": _agg(early), "late": _agg(late)}
+
+
 def reverse_categorical_jump_nll(
     *,
     model,
