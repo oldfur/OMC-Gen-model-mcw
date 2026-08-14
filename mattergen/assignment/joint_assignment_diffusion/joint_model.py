@@ -53,12 +53,14 @@ class JointAXLModel(nn.Module):
         hidden: int | None = None,
         schedule: AsyncJumpSchedule | None = None,
         g_copy_context_mode: str = "mean",
+        g_relation_detach_trunk: bool = True,
     ):
         super().__init__()
         self.denoiser = denoiser
         self.hidden = int(hidden or getattr(denoiser, "hidden_dim", 512))
         self.schedule = schedule or AsyncJumpSchedule()
         self.g_copy_context_mode = str(g_copy_context_mode or "mean")
+        self.g_relation_detach_trunk = bool(g_relation_detach_trunk)
         self.orbit_encoder = OrbitSiteEncoder(hidden=self.hidden)
         self.orbit_to_node = nn.Sequential(
             nn.Linear(self.hidden, self.hidden),
@@ -107,6 +109,27 @@ class JointAXLModel(nn.Module):
 
     def pretrained_parameters(self):
         yield from self.denoiser.parameters()
+
+    def g_specific_parameters(self):
+        """G-only modules that L_G is allowed to update under isolation."""
+        for m in (self.orbit_slot_ctx, self.g_head):
+            yield from m.parameters()
+
+    def shared_trunk_parameters(self):
+        """GemNet + shared A-conditioning (must not receive L_G when detached)."""
+        for m in (
+            self.denoiser,
+            self.orbit_encoder,
+            self.orbit_to_node,
+            self.clock_emb,
+            self.clock_to_node,
+            self.rho,
+            self.spatial_edge,
+            self.assign_mp,
+            self.copy_pool,
+            self.copy_to_node,
+        ):
+            yield from m.parameters()
 
     def set_orbit_relations(self, partition, role_edge_index, role_bond_type):
         self.rho.set_from_role_graph(
@@ -264,8 +287,20 @@ class JointAXLModel(nn.Module):
         if compute_jumps:
             v, c_i, v_a = self.copy_pool(h, orbit_of, copy_of, z_orbit, state.K)
             moves = enumerate_legal_moves(state)
-            use_slots = self.g_copy_context_mode in ("orbit_slot", "orbit_slot_geometry")
-            use_geom = self.g_copy_context_mode == "orbit_slot_geometry"
+            use_slots = self.g_copy_context_mode in (
+                "orbit_slot",
+                "orbit_slot_geometry",
+                "template_counterfactual",
+            )
+            use_geom = self.g_copy_context_mode in (
+                "orbit_slot_geometry",
+                "template_counterfactual",
+            )
+            if self.g_relation_detach_trunk:
+                h_g = h.detach()
+                z_g = z_orbit.detach()
+            else:
+                h_g, z_g = h, z_orbit
             scored, slot_diag = compute_move_logits(
                 moves=moves,
                 h=h,
@@ -280,7 +315,10 @@ class JointAXLModel(nn.Module):
                 t_scalar=t_scalar,
                 frac=chemgraph["pos"] if use_geom else None,
                 cell=chemgraph["cell"] if use_geom else None,
+                h_g=h_g,
+                z_orbit_g=z_g,
             )
+            slot_diag["g_relation_detach_trunk"] = bool(self.g_relation_detach_trunk)
             jump_diag.update(slot_diag)
             move_logits = scored
             # J1.1: r_m = β(t) · softmax(ℓ)_m  (fixed total exit rate)

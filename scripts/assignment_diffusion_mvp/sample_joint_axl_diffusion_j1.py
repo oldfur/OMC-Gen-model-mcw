@@ -100,9 +100,14 @@ def main() -> None:
         strict=True,
     )
     schedule = AsyncJumpSchedule.from_config(cfg.get("schedule") or {})
-    g_ctx = str(cfg.get("g_copy_context_mode") or "orbit_slot_geometry")
+    g_ctx = str(cfg.get("g_copy_context_mode") or "template_counterfactual")
+    g_detach = bool(cfg.get("g_relation_detach_trunk", True))
     model = JointAXLModel(
-        bundle.denoiser.to(device), num_orbits=partition.J, schedule=schedule, g_copy_context_mode=g_ctx
+        bundle.denoiser.to(device),
+        num_orbits=partition.J,
+        schedule=schedule,
+        g_copy_context_mode=g_ctx,
+        g_relation_detach_trunk=g_detach,
     ).to(device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["joint_state_dict"], strict=False)

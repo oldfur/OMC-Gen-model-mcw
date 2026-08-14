@@ -22,6 +22,7 @@ from mattergen.assignment.joint_assignment_diffusion.losses import (
     event_conditioned_assignment_ce,
     event_conditioned_g_teacher_ce,
     geometry_step_loss,
+    isolation_grad_norms,
 )
 from mattergen.assignment.soft_c_geometry_feedback_n2.geometry_loss import mattergen_geometry_loss
 from mattergen.assignment.joint_assignment_diffusion.reverse_eval import (
@@ -155,9 +156,14 @@ def main() -> None:
 
     sch_cfg = cfg.get("schedule") or {}
     schedule = AsyncJumpSchedule.from_config(sch_cfg)
-    g_ctx = str(cfg.get("g_copy_context_mode") or "orbit_slot_geometry")
+    g_ctx = str(cfg.get("g_copy_context_mode") or "template_counterfactual")
+    g_detach = bool(cfg.get("g_relation_detach_trunk", True))
     model = JointAXLModel(
-        denoiser, num_orbits=partition.J, schedule=schedule, g_copy_context_mode=g_ctx
+        denoiser,
+        num_orbits=partition.J,
+        schedule=schedule,
+        g_copy_context_mode=g_ctx,
+        g_relation_detach_trunk=g_detach,
     ).to(device)
     sample_d = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in sample.items()}
     model.set_orbit_relations(partition, sample_d["role_edge_index"], sample_d["role_bond_type"])
@@ -187,9 +193,11 @@ def main() -> None:
         "J1_2": "event_conditioned_assignment",
         "J1_3A": "improvement_weighted_g_teacher",
         "J1_3B2": "candidate_to_copy_pbc_geometry",
+        "J1_3B3": "template_counterfactual_g_policy",
         "G_SUPERVISION": str((cfg.get("g_supervision") or "improvement_weighted")),
         "G_TEACHER_TEMPERATURE": float((cfg.get("g_teacher_temperature") or 0.02)),
-        "G_COPY_CONTEXT_MODE": str(cfg.get("g_copy_context_mode") or "orbit_slot_geometry"),
+        "G_COPY_CONTEXT_MODE": str(cfg.get("g_copy_context_mode") or "template_counterfactual"),
+        "G_RELATION_DETACH_TRUNK": g_detach,
         "R_WINDOW": list(schedule.r_window),
         "G_WINDOW": list(schedule.g_window),
         "KAPPA_R": schedule.kappa_r,
@@ -394,6 +402,22 @@ def main() -> None:
                     "candidate_copy_relation_variance_across_candidates",
                     "current_vs_cross_relation_distance",
                     "g_logit_std_across_legal_moves",
+                    "g_relation_detach_trunk",
+                    "template_relation_norm",
+                    "compatibility_S_mean",
+                    "compatibility_S_std",
+                    "delta_S_mean",
+                    "delta_S_std",
+                    "abs_delta_S_mean",
+                    "counterfactual_feature_norm",
+                    "counterfactual_feature_var",
+                    "delta_S_beneficial_mean",
+                    "delta_S_harmful_mean",
+                    "spearman_logit_vs_utility",
+                    "spearman_deltaS_vs_utility",
+                    "grad_norm_G_specific_from_LG",
+                    "grad_norm_shared_trunk_from_LG",
+                    "grad_norm_R_head_from_LG",
                 ):
                     if k in ev_diag and ev_diag[k] is not None:
                         v = ev_diag[k]
@@ -415,6 +439,11 @@ def main() -> None:
                     state_at_t=state_t,
                 )
                 L_geom = geom["L_geom"]
+            if picked is not None and picked.kind == "G":
+                iso = isolation_grad_norms(model, ce_g)
+                ev_diag.update(iso)
+                if event_records:
+                    event_records[-1].update({k: float(v) for k, v in iso.items()})
             total = L_geom + lam_r * ce_r + lam_g * ce_g
             total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -426,6 +455,7 @@ def main() -> None:
                 "t_focus": t_focus,
                 "g_supervision": g_sup,
                 "g_copy_context_mode": g_ctx,
+                "g_relation_detach_trunk": float(g_detach),
                 "has_event_target": picked is not None,
                 "event_kind": None if picked is None else picked.kind,
                 "geometry_loss": float(L_geom.detach()),
@@ -456,6 +486,11 @@ def main() -> None:
                 "beta_R_t": float(schedule.beta_r(t_f).item()),
                 "beta_G_t": float(schedule.beta_g(t_f).item()),
                 "state_t_legal": state_t.validate()["legal"],
+                "grad_norm_G_specific_from_LG": float(ev_diag.get("grad_norm_G_specific_from_LG", 0.0)) if ev_diag else 0.0,
+                "grad_norm_shared_trunk_from_LG": float(ev_diag.get("grad_norm_shared_trunk_from_LG", 0.0)) if ev_diag else 0.0,
+                "grad_norm_R_head_from_LG": float(ev_diag.get("grad_norm_R_head_from_LG", 0.0)) if ev_diag else 0.0,
+                "spearman_logit_vs_utility": float(ev_diag.get("spearman_logit_vs_utility", 0.0)) if ev_diag else 0.0,
+                "spearman_deltaS_vs_utility": float(ev_diag.get("spearman_deltaS_vs_utility", 0.0)) if ev_diag else 0.0,
             }
             stream.write(json.dumps(row) + "\n")
             if step % log_every == 0 or step + 1 == steps:

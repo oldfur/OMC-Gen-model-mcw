@@ -25,6 +25,110 @@ def _pair_key(i: int, j: int) -> tuple[int, int]:
     return (i, j) if i < j else (j, i)
 
 
+_G_REPR_KEYS = (
+    "g_copy_context_mode",
+    "g_relation_detach_trunk",
+    "slot_embedding_norm_mean",
+    "slot_embedding_norm_std",
+    "slot_pair_feature_norm",
+    "slot_orbit_pairwise_var",
+    "candidate_copy_geom_norm_mean",
+    "candidate_copy_geom_norm_std",
+    "candidate_copy_relation_norm_mean",
+    "candidate_copy_relation_norm_std",
+    "candidate_copy_relation_variance_across_copies",
+    "candidate_copy_relation_variance_across_candidates",
+    "current_vs_cross_relation_distance",
+    "g_logit_std_across_legal_moves",
+    "template_relation_norm",
+    "compatibility_S_mean",
+    "compatibility_S_std",
+    "delta_S_mean",
+    "delta_S_std",
+    "abs_delta_S_mean",
+    "counterfactual_feature_norm",
+    "counterfactual_feature_var",
+)
+
+
+def _g_repr_fields(out) -> dict[str, Any]:
+    diag = getattr(out, "diagnostics", {}) or {}
+    fields: dict[str, Any] = {}
+    for k in _G_REPR_KEYS:
+        v = diag.get(k, 0.0 if k != "g_copy_context_mode" else "mean")
+        if k == "g_relation_detach_trunk":
+            fields[k] = float(bool(v))
+        else:
+            fields[k] = v
+    return fields
+
+
+def _average_ranks(x: torch.Tensor) -> torch.Tensor:
+    """1-based average ranks (tied values share the mean rank)."""
+    n = int(x.numel())
+    ranks = torch.zeros(n, dtype=torch.float32)
+    if n == 0:
+        return ranks
+    order = torch.argsort(x, stable=True)
+    xs = x[order]
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and float(xs[j]) == float(xs[i]):
+            j += 1
+        avg = 0.5 * ((i + 1) + j)
+        ranks[order[i:j]] = avg
+        i = j
+    return ranks
+
+
+def spearman_tied(x: torch.Tensor, y: torch.Tensor) -> float:
+    """Tied-rank Spearman correlation; 0 if undefined."""
+    if x.numel() < 2 or y.numel() != x.numel():
+        return 0.0
+    rx = _average_ranks(x.detach().float().reshape(-1).cpu())
+    ry = _average_ranks(y.detach().float().reshape(-1).cpu())
+    rx = rx - rx.mean()
+    ry = ry - ry.mean()
+    den = float(rx.norm() * ry.norm())
+    if den < 1e-12:
+        return 0.0
+    return float((rx * ry).sum() / den)
+
+
+def isolation_grad_norms(model, ce_g: torch.Tensor) -> dict[str, float]:
+    """Grad norms of L_G w.r.t. G-specific / shared trunk / R-head."""
+    zeros = {
+        "grad_norm_G_specific_from_LG": 0.0,
+        "grad_norm_shared_trunk_from_LG": 0.0,
+        "grad_norm_R_head_from_LG": 0.0,
+    }
+    if not (torch.is_tensor(ce_g) and ce_g.requires_grad and ce_g.grad_fn is not None):
+        return zeros
+    groups = {
+        "grad_norm_G_specific_from_LG": [p for p in model.g_specific_parameters() if p.requires_grad],
+        "grad_norm_shared_trunk_from_LG": [p for p in model.shared_trunk_parameters() if p.requires_grad],
+        "grad_norm_R_head_from_LG": [p for p in model.r_head.parameters() if p.requires_grad],
+    }
+    all_p = groups["grad_norm_G_specific_from_LG"] + groups["grad_norm_shared_trunk_from_LG"] + groups[
+        "grad_norm_R_head_from_LG"
+    ]
+    if not all_p:
+        return zeros
+    grads = torch.autograd.grad(ce_g, all_p, retain_graph=True, allow_unused=True)
+    out = {}
+    i = 0
+    for name, params in groups.items():
+        acc = 0.0
+        for p in params:
+            g = grads[i]
+            i += 1
+            if g is not None:
+                acc += float(g.detach().float().pow(2).sum())
+        out[name] = acc ** 0.5
+    return out
+
+
 def reverse_categorical_jump_nll(
     *,
     model,
@@ -230,25 +334,7 @@ def event_conditioned_assignment_ce(
         "num_legal": n_legal,
         "hit": hit,
         "chemgraph_scores": out.chemgraph_scores,
-        "g_copy_context_mode": out.diagnostics.get("g_copy_context_mode", "mean"),
-        "slot_embedding_norm_mean": out.diagnostics.get("slot_embedding_norm_mean", 0.0),
-        "slot_embedding_norm_std": out.diagnostics.get("slot_embedding_norm_std", 0.0),
-        "slot_pair_feature_norm": out.diagnostics.get("slot_pair_feature_norm", 0.0),
-        "slot_orbit_pairwise_var": out.diagnostics.get("slot_orbit_pairwise_var", 0.0),
-        "candidate_copy_geom_norm_mean": out.diagnostics.get("candidate_copy_geom_norm_mean", 0.0),
-        "candidate_copy_geom_norm_std": out.diagnostics.get("candidate_copy_geom_norm_std", 0.0),
-        "candidate_copy_relation_norm_mean": out.diagnostics.get("candidate_copy_relation_norm_mean", 0.0),
-        "candidate_copy_relation_norm_std": out.diagnostics.get("candidate_copy_relation_norm_std", 0.0),
-        "candidate_copy_relation_variance_across_copies": out.diagnostics.get(
-            "candidate_copy_relation_variance_across_copies", 0.0
-        ),
-        "candidate_copy_relation_variance_across_candidates": out.diagnostics.get(
-            "candidate_copy_relation_variance_across_candidates", 0.0
-        ),
-        "current_vs_cross_relation_distance": out.diagnostics.get(
-            "current_vs_cross_relation_distance", 0.0
-        ),
-        "g_logit_std_across_legal_moves": out.diagnostics.get("g_logit_std_across_legal_moves", 0.0),
+        **_g_repr_fields(out),
     }
 
 
@@ -285,30 +371,56 @@ def event_conditioned_g_teacher_ce(
         ce = -(q_dev * pi.clamp_min(1e-12).log()).sum()
     tdiag = teacher_diagnostics(utils=utils, teacher=teacher, hist_key=_pair_key(hist_i, hist_j))
     pqual = policy_quality(utils=utils, teacher=teacher, pi=pi if pi.numel() else zero)
+    u = teacher.get("u")
+    if u is None:
+        u = torch.tensor([float(r["u"]) for r in utils], dtype=torch.float32)
+    logit_list = []
+    ds_list = []
+    ds_vec = out.diagnostics.get("delta_S_vec")
+    scored_g = out.move_logits.get("G", []) if out.move_logits else []
+    ds_map = {}
+    if torch.is_tensor(ds_vec) and ds_vec.numel() == len(scored_g):
+        for (m, _), dsv in zip(scored_g, ds_vec):
+            ds_map[_pair_key(m.i, m.j)] = dsv
+    u_ord = []
+    for r in utils:
+        key = r["key"]
+        u_ord.append(float(r["u"]))
+        hit = None
+        for m, lg in scored_g:
+            if _pair_key(m.i, m.j) == key:
+                hit = lg
+                break
+        logit_list.append(hit if hit is not None else zero)
+        if key in ds_map:
+            ds_list.append(ds_map[key])
+    if logit_list:
+        logits_al = torch.stack([lg if torch.is_tensor(lg) else zero for lg in logit_list])
+        spear_lg = spearman_tied(logits_al, torch.tensor(u_ord, dtype=torch.float32))
+    else:
+        spear_lg = 0.0
+    spear_ds = 0.0
+    ds_ben = 0.0
+    ds_harm = 0.0
+    if ds_list and len(ds_list) == len(u_ord):
+        ds_t = torch.stack([d.reshape(()) if d.ndim else d for d in ds_list]).detach().float().cpu()
+        u_t = torch.tensor(u_ord, dtype=torch.float32)
+        spear_ds = spearman_tied(ds_t, u_t)
+        ben = u_t > 0
+        if bool(ben.any()):
+            ds_ben = float(ds_t[ben].mean())
+        if bool((~ben).any()):
+            ds_harm = float(ds_t[~ben].mean())
     return {
         "CE": ce,
         "uniform_CE": pqual["uniform_CE_teacher"],
         "delta_CE": pqual["delta_CE_teacher"],
         "chemgraph_scores": out.chemgraph_scores,
-        "g_copy_context_mode": out.diagnostics.get("g_copy_context_mode", "mean"),
-        "slot_embedding_norm_mean": out.diagnostics.get("slot_embedding_norm_mean", 0.0),
-        "slot_embedding_norm_std": out.diagnostics.get("slot_embedding_norm_std", 0.0),
-        "slot_pair_feature_norm": out.diagnostics.get("slot_pair_feature_norm", 0.0),
-        "slot_orbit_pairwise_var": out.diagnostics.get("slot_orbit_pairwise_var", 0.0),
-        "candidate_copy_geom_norm_mean": out.diagnostics.get("candidate_copy_geom_norm_mean", 0.0),
-        "candidate_copy_geom_norm_std": out.diagnostics.get("candidate_copy_geom_norm_std", 0.0),
-        "candidate_copy_relation_norm_mean": out.diagnostics.get("candidate_copy_relation_norm_mean", 0.0),
-        "candidate_copy_relation_norm_std": out.diagnostics.get("candidate_copy_relation_norm_std", 0.0),
-        "candidate_copy_relation_variance_across_copies": out.diagnostics.get(
-            "candidate_copy_relation_variance_across_copies", 0.0
-        ),
-        "candidate_copy_relation_variance_across_candidates": out.diagnostics.get(
-            "candidate_copy_relation_variance_across_candidates", 0.0
-        ),
-        "current_vs_cross_relation_distance": out.diagnostics.get(
-            "current_vs_cross_relation_distance", 0.0
-        ),
-        "g_logit_std_across_legal_moves": out.diagnostics.get("g_logit_std_across_legal_moves", 0.0),
+        "spearman_logit_vs_utility": spear_lg,
+        "spearman_deltaS_vs_utility": spear_ds,
+        "delta_S_beneficial_mean": ds_ben,
+        "delta_S_harmful_mean": ds_harm,
+        **_g_repr_fields(out),
         **tdiag,
         **pqual,
     }

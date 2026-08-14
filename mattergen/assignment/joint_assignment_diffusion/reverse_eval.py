@@ -240,6 +240,15 @@ def aggregate_g_teacher_bins(records: list[dict[str, Any]]) -> dict[str, Any]:
             "num_beneficial_G": m("num_beneficial_G"),
             "historical_inverse_is_best": m("historical_inverse_is_best"),
             "g_teacher_no_beneficial": m("g_teacher_no_beneficial"),
+            "spearman_logit_vs_utility": m("spearman_logit_vs_utility"),
+            "spearman_deltaS_vs_utility": m("spearman_deltaS_vs_utility"),
+            "delta_S_mean": m("delta_S_mean"),
+            "abs_delta_S_mean": m("abs_delta_S_mean"),
+            "delta_S_beneficial_mean": m("delta_S_beneficial_mean"),
+            "delta_S_harmful_mean": m("delta_S_harmful_mean"),
+            "candidate_copy_relation_variance_across_copies": m(
+                "candidate_copy_relation_variance_across_copies"
+            ),
         }
 
     out: dict[str, Any] = {"all": _agg(g_recs), "by_bin": {}}

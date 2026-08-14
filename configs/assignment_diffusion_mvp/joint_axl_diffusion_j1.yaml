@@ -20,8 +20,9 @@ joint_j1:
   # J1.3-A: G teacher (historical | improvement_weighted)
   g_supervision: improvement_weighted
   g_teacher_temperature: 0.02
-  # J1.3-B: mean (B0) | orbit_slot (B1) | orbit_slot_geometry (B2)
-  g_copy_context_mode: orbit_slot_geometry
+  # J1.3-B: mean | orbit_slot | orbit_slot_geometry | template_counterfactual
+  g_copy_context_mode: template_counterfactual
+  g_relation_detach_trunk: true
 
   loss:
     lambda_r: 1.0

@@ -333,6 +333,9 @@ def _init_g_head_nonzero(head):
     if hasattr(head, "geom_out"):
         nn.init.xavier_uniform_(head.geom_out[-1].weight)
         nn.init.zeros_(head.geom_out[-1].bias)
+    if hasattr(head, "cf_out"):
+        nn.init.xavier_uniform_(head.cf_out[-1].weight)
+        nn.init.zeros_(head.cf_out[-1].bias)
     if hasattr(head, "slot_out"):
         nn.init.xavier_uniform_(head.slot_out[-1].weight)
         nn.init.zeros_(head.slot_out[-1].bias)
@@ -571,14 +574,178 @@ def test_candidate_copy_geometry_pair_and_copy_symmetry():
     assert torch.allclose(logits0, torch.zeros_like(logits0), atol=1e-6)
 
 
-def test_g_copy_context_modes_b0_b1_b2_still_registered():
-    """Ablation switch keeps mean / orbit_slot / orbit_slot_geometry."""
+def test_g_copy_context_modes_b0_b1_b2_b3_still_registered():
+    """Ablation switch keeps mean / orbit_slot / geometry / template_counterfactual."""
     from mattergen.assignment.joint_assignment_diffusion.jump_heads import (
         GJumpHead,
         _G_COPY_CONTEXT_MODES,
     )
 
-    assert _G_COPY_CONTEXT_MODES == ("mean", "orbit_slot", "orbit_slot_geometry")
+    assert _G_COPY_CONTEXT_MODES == (
+        "mean",
+        "orbit_slot",
+        "orbit_slot_geometry",
+        "template_counterfactual",
+    )
     for mode in _G_COPY_CONTEXT_MODES:
         head = GJumpHead(8, copy_context_mode=mode)
         assert head.copy_context_mode == mode
+
+
+def _toy_rho_table(j: int = 3):
+    from mattergen.assignment.joint_assignment_diffusion.conditioning import OrbitRelationTable
+
+    rho = OrbitRelationTable(num_orbits=j, dim=32)
+    st, partition, _ = _toy_state()
+    # undirected molecular path on roles 0-1-2-3
+    edges = torch.tensor([[0, 1, 1, 2, 2, 3], [1, 0, 2, 1, 3, 2]])
+    btype = torch.ones(edges.shape[1], dtype=torch.long)
+    rho.set_from_role_graph(partition=partition, role_edge_index=edges, role_bond_type=btype)
+    return rho, st
+
+
+def test_template_rho_orbit_invariant_and_disconnected_bin():
+    """ρ is orbit-aggregated; disconnected ≠ ordinary hop count."""
+    from mattergen.assignment.joint_assignment_diffusion.conditioning import OrbitRelationTable
+
+    rho = OrbitRelationTable(num_orbits=3, dim=16)
+    # two roles in orbit 1 are equivalent: edges 0-1 and 0-2 must pool
+    # partition: [[0],[1,2],[3]] from _toy_state — rebuild explicitly
+    from mattergen.assignment.global_copy_assembly.orbit_membership import build_orbit_partition
+
+    partition = build_orbit_partition([[0], [1, 2], [3]])
+    edges_a = torch.tensor([[0, 1], [1, 0]])
+    edges_b = torch.tensor([[0, 2], [2, 0]])
+    bt = torch.tensor([2, 2])
+    rho.set_from_role_graph(partition=partition, role_edge_index=edges_a, role_bond_type=bt)
+    exists_a = rho.bond_exists.clone()
+    mult_a = rho.edge_mult.clone()
+    rho.set_from_role_graph(partition=partition, role_edge_index=edges_b, role_bond_type=bt)
+    assert torch.allclose(exists_a, rho.bond_exists)
+    assert torch.allclose(mult_a, rho.edge_mult)
+    # 0 bonded to orbit-1; orbit-2 disconnected
+    assert float(rho.bond_exists[0, 1]) == 1.0
+    assert float(rho.bond_exists[0, 2]) == 0.0
+    assert int(rho.dist_bin[0, 0]) == 0
+    assert int(rho.dist_bin[0, 2]) == OrbitRelationTable.DIST_BIN_DISCONNECTED
+
+
+def test_template_counterfactual_pair_and_copy_symmetry():
+    """g_swap_logit(i,j,k,l) == g_swap_logit(j,i,l,k); copy relabel invariant."""
+    import torch.nn as nn
+
+    from mattergen.assignment.joint_assignment_diffusion.conditioning import OrbitSlotCopyContext
+    from mattergen.assignment.joint_assignment_diffusion.jump_heads import GJumpHead
+
+    torch.manual_seed(3)
+    n, hid, k, j = 6, 8, 2, 3
+    orbit_of = torch.tensor([0, 1, 2, 0, 1, 2])
+    copy_of = torch.tensor([0, 0, 0, 1, 1, 1])
+    h = torch.randn(n, hid)
+    z_orbit = torch.randn(j, hid)
+    frac = torch.rand(n, 3)
+    cell = torch.eye(3) * 9.0
+    rho, _ = _toy_rho_table(j)
+    ctx = OrbitSlotCopyContext(hid)
+    U, feat, cnt = ctx.slot_table(h, orbit_of=orbit_of, copy_of=copy_of, z_orbit=z_orbit, K=k, J=j)
+    u_excl = ctx.exclude_atom_slots(U, cnt, feat, orbit_of, copy_of)
+    head = GJumpHead(hid, copy_context_mode="template_counterfactual")
+    _init_g_head_nonzero(head)
+    nn.init.xavier_uniform_(head.cf_out[-1].weight)
+    nn.init.zeros_(head.cf_out[-1].bias)
+
+    ii = torch.tensor([0, 1, 2])
+    jj = torch.tensor([3, 4, 5])
+    kwargs = dict(
+        z_orbit=z_orbit,
+        orbit_of=orbit_of,
+        copy_of=copy_of,
+        U=U,
+        u_excl=u_excl,
+        slot_cnt=cnt,
+        frac=frac,
+        cell=cell,
+        t_scalar=0.45,
+        K=k,
+        J=j,
+        rho_table=rho,
+    )
+    logits, diag = head.batch_logits_template_counterfactual(h, ii, jj, **kwargs)
+    logits_swap, _ = head.batch_logits_template_counterfactual(h, jj, ii, **kwargs)
+    assert torch.allclose(logits, logits_swap, atol=1e-5)
+    assert torch.isfinite(logits).all()
+    assert "delta_S_vec" in diag
+    ds_swap = head.batch_logits_template_counterfactual(h, jj, ii, **kwargs)[1]["delta_S_vec"]
+    assert torch.allclose(diag["delta_S_vec"], ds_swap, atol=1e-5)
+
+    perm = torch.tensor([1, 0])
+    copy2 = perm[copy_of]
+    U2, feat2, cnt2 = ctx.slot_table(h, orbit_of=orbit_of, copy_of=copy2, z_orbit=z_orbit, K=k, J=j)
+    u_ex2 = ctx.exclude_atom_slots(U2, cnt2, feat2, orbit_of, copy2)
+    kwargs2 = dict(kwargs)
+    kwargs2.update(copy_of=copy2, U=U2, u_excl=u_ex2, slot_cnt=cnt2)
+    logits_p, _ = head.batch_logits_template_counterfactual(h, ii, jj, **kwargs2)
+    assert torch.allclose(logits, logits_p, atol=1e-5)
+
+    nn.init.zeros_(head.cf_out[-1].weight)
+    nn.init.zeros_(head.cf_out[-1].bias)
+    logits0, _ = head.batch_logits_template_counterfactual(h, ii, jj, **kwargs)
+    assert torch.allclose(logits0, torch.zeros_like(logits0), atol=1e-6)
+
+
+def test_template_counterfactual_detach_does_not_flow_to_trunk():
+    """L_G through detached h^G must not populate trunk grads."""
+    import torch.nn as nn
+
+    from mattergen.assignment.joint_assignment_diffusion.conditioning import OrbitSlotCopyContext
+    from mattergen.assignment.joint_assignment_diffusion.jump_heads import GJumpHead
+
+    torch.manual_seed(4)
+    n, hid, k, j = 6, 8, 2, 3
+    orbit_of = torch.tensor([0, 1, 2, 0, 1, 2])
+    copy_of = torch.tensor([0, 0, 0, 1, 1, 1])
+    trunk = nn.Linear(3, hid)
+    frac = torch.rand(n, 3)
+    h_live = trunk(frac)
+    h_g = h_live.detach()
+    z_orbit = torch.randn(j, hid)
+    cell = torch.eye(3) * 9.0
+    rho, _ = _toy_rho_table(j)
+    ctx = OrbitSlotCopyContext(hid)
+    U, feat, cnt = ctx.slot_table(h_g, orbit_of=orbit_of, copy_of=copy_of, z_orbit=z_orbit, K=k, J=j)
+    u_excl = ctx.exclude_atom_slots(U, cnt, feat, orbit_of, copy_of)
+    head = GJumpHead(hid, copy_context_mode="template_counterfactual")
+    _init_g_head_nonzero(head)
+    nn.init.xavier_uniform_(head.cf_out[-1].weight)
+    logits, _ = head.batch_logits_template_counterfactual(
+        h_g,
+        torch.tensor([0, 1, 2]),
+        torch.tensor([3, 4, 5]),
+        z_orbit=z_orbit,
+        orbit_of=orbit_of,
+        copy_of=copy_of,
+        U=U,
+        u_excl=u_excl,
+        slot_cnt=cnt,
+        frac=frac,
+        cell=cell,
+        t_scalar=0.45,
+        K=k,
+        J=j,
+        rho_table=rho,
+    )
+    logits.sum().backward()
+    assert trunk.weight.grad is None
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in head.cf_out.parameters())
+
+
+def test_spearman_tied_ranks():
+    from mattergen.assignment.joint_assignment_diffusion.losses import spearman_tied
+
+    x = torch.tensor([1.0, 2.0, 3.0])
+    y = torch.tensor([1.0, 2.0, 3.0])
+    assert abs(spearman_tied(x, y) - 1.0) < 1e-6
+    assert abs(spearman_tied(x, -y) + 1.0) < 1e-6
+    xt = torch.tensor([1.0, 1.0, 2.0])
+    yt = torch.tensor([3.0, 3.0, 9.0])
+    assert spearman_tied(xt, yt) > 0.9

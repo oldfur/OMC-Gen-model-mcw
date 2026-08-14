@@ -11,7 +11,17 @@ from mattergen.assignment.global_copy_assembly.pair_potential import (
 
 
 class OrbitRelationTable(nn.Module):
-    """Learned embedding of orbit-pair molecular relation ρ_{oo'}."""
+    """Learned embedding of orbit-pair molecular relation ρ_{oo'}.
+
+    Discrete template buffers (bond existence / type / multiplicity / binned
+    graph distance) are automorphism-orbit aggregates of the clean molecular
+    role graph.  ``forward`` is the historical R/GemNet embedding and is left
+    unchanged.  B3 G-policy reads the raw buffers via ``raw_template`` and
+    embeds them with a G-specific encoder.
+    """
+
+    # dist_bin: 0=self, 1, 2, 3, 4=reachable ≥4, 5=disconnected
+    DIST_BIN_DISCONNECTED = 5
 
     def __init__(self, num_orbits: int, dim: int = 32, max_path: int = 16):
         super().__init__()
@@ -22,6 +32,11 @@ class OrbitRelationTable(nn.Module):
         # buffers filled externally
         self.register_buffer("bond_type", torch.zeros(num_orbits, num_orbits, dtype=torch.long))
         self.register_buffer("graph_dist", torch.full((num_orbits, num_orbits), max_path - 1, dtype=torch.long))
+        self.register_buffer("bond_exists", torch.zeros(num_orbits, num_orbits))
+        self.register_buffer("edge_mult", torch.zeros(num_orbits, num_orbits))
+        self.register_buffer(
+            "dist_bin", torch.full((num_orbits, num_orbits), self.DIST_BIN_DISCONNECTED, dtype=torch.long)
+        )
 
     def set_from_role_graph(
         self,
@@ -31,9 +46,12 @@ class OrbitRelationTable(nn.Module):
         role_bond_type: torch.Tensor,
     ) -> None:
         j = self.num_orbits
-        bond = torch.zeros(j, j, dtype=torch.long, device=role_edge_index.device)
+        device = role_edge_index.device
+        bond = torch.zeros(j, j, dtype=torch.long, device=device)
         # adjacency on orbits
-        adj = torch.zeros(j, j, dtype=torch.float32, device=role_edge_index.device)
+        adj = torch.zeros(j, j, dtype=torch.float32, device=device)
+        edge_mult = torch.zeros(j, j, dtype=torch.float32, device=device)
+        seen_undirected: set[tuple[int, int]] = set()
         for e in range(role_edge_index.shape[1]):
             r0 = int(role_edge_index[0, e].item())
             r1 = int(role_edge_index[1, e].item())
@@ -45,6 +63,13 @@ class OrbitRelationTable(nn.Module):
             if o0 != o1:
                 adj[o0, o1] = 1.0
                 adj[o1, o0] = 1.0
+            key = (min(r0, r1), max(r0, r1))
+            if key in seen_undirected:
+                continue
+            seen_undirected.add(key)
+            edge_mult[o0, o1] += 1.0
+            if o0 != o1:
+                edge_mult[o1, o0] += 1.0
         # BFS distances on orbit quotient graph
         dist = torch.full((j, j), self.dist_emb.num_embeddings - 1, dtype=torch.long, device=adj.device)
         for s in range(j):
@@ -60,8 +85,26 @@ class OrbitRelationTable(nn.Module):
                             dist[s, v] = nd
                         seen.add(v)
                         q.append(v)
+        disconnected = self.dist_emb.num_embeddings - 1
+        dist = dist.clamp(0, disconnected)
+        dist_bin = torch.full((j, j), self.DIST_BIN_DISCONNECTED, dtype=torch.long, device=device)
+        reachable = dist < disconnected
+        dist_bin = torch.where(reachable, dist.clamp(max=4), dist_bin)
+        dist_bin.fill_diagonal_(0)
         self.bond_type = bond
-        self.graph_dist = dist.clamp(0, self.dist_emb.num_embeddings - 1)
+        self.graph_dist = dist
+        self.bond_exists = (edge_mult > 0).to(dtype=torch.float32)
+        self.edge_mult = edge_mult
+        self.dist_bin = dist_bin
+
+    def raw_template(self, o_i: torch.Tensor, o_j: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Discrete orbit-pair template (no learned params, no copy id)."""
+        return {
+            "bond_type": self.bond_type[o_i, o_j],
+            "dist_bin": self.dist_bin[o_i, o_j],
+            "bond_exists": self.bond_exists[o_i, o_j],
+            "edge_mult": self.edge_mult[o_i, o_j],
+        }
 
     def forward(self, o_i: torch.Tensor, o_j: torch.Tensor) -> torch.Tensor:
         bt = self.bond_type[o_i, o_j]
