@@ -170,17 +170,6 @@ def trunk_rg_interference_metrics(
     }
 
 
-def _snapshot_named_buffers(model) -> dict[str, torch.Tensor]:
-    return {n: b.detach().clone() for n, b in model.named_buffers()}
-
-
-def _restore_named_buffers(model, snap: dict[str, torch.Tensor]) -> None:
-    with torch.no_grad():
-        for n, b in model.named_buffers():
-            if n in snap:
-                b.copy_(snap[n])
-
-
 def coupled_trunk_interference_audit(
     *,
     model,
@@ -191,10 +180,10 @@ def coupled_trunk_interference_audit(
 ) -> dict[str, float]:
     """Shared-trunk R vs G interference on a fixed R probe.
 
-    Does not write ``.grad``, does not step the optimizer, and restores
-    parameter data + buffers so the training trajectory is unchanged.
-    ``Δ_G L_R`` is an isolated SGD step ``θ_s ← θ_s − lr ⊙ g_G`` (no Adam
-    moments, no L_geom) so damage is attributable to L_G coupling.
+    Never in-place mutates live parameters (they sit in the ``ce_g`` graph
+    that ``total.backward()`` still needs).  Damage is the directional
+    derivative ``⟨g_R, −lr ⊙ g_G⟩``, i.e. first-order ``Δ_G L_R`` for an
+    isolated SGD step of ``L_G`` on ``θ_s`` (no Adam, no ``L_geom``).
     """
     empty = {
         "cos_RG": 0.0,
@@ -219,8 +208,6 @@ def coupled_trunk_interference_audit(
     g_g = flatten_param_grads(trunk, g_g_list)
 
     was_training = model.training
-    buf_snap = _snapshot_named_buffers(model)
-    backups = [p.detach().clone() for p in trunk]
     try:
         model.eval()
         r_pre = event_conditioned_assignment_ce(
@@ -241,7 +228,7 @@ def coupled_trunk_interference_audit(
         g_r = flatten_param_grads(trunk, g_r_list)
         mets = trunk_rg_interference_metrics(g_r, g_g, eps=eps)
 
-        # first-order: ⟨g_R, −lr ⊙ g_G⟩
+        # first-order isolated G-step damage; do not write θ_s
         lin = 0.0
         with torch.no_grad():
             for p, gr, gg in zip(trunk, g_r_list, g_g_list):
@@ -250,37 +237,16 @@ def coupled_trunk_interference_audit(
                     continue
                 lin += float((-lr) * (gr.detach().float() * gg.detach().float()).sum())
 
-        with torch.no_grad():
-            for p, gg in zip(trunk, g_g_list):
-                lr = float(param_lrs.get(id(p), 0.0))
-                if gg is None or lr == 0.0:
-                    continue
-                p.add_(gg.detach(), alpha=-lr)
-
-        r_post = event_conditioned_assignment_ce(
-            model=model,
-            chemgraph_t=probe["chemgraph_t"],
-            t=probe["t"],
-            state_after=probe["state"],
-            kind="R",
-            i=int(probe["i"]),
-            j=int(probe["j"]),
-        )
-        l_post = float(r_post["CE"].detach())
         mets.update(
             {
-                "delta_G_LR": l_post - l_pre,
+                "delta_G_LR": lin,
                 "delta_G_LR_linear": lin,
                 "L_R_probe_pre": l_pre,
-                "L_R_probe_post": l_post,
+                "L_R_probe_post": l_pre + lin,
             }
         )
         return mets
     finally:
-        with torch.no_grad():
-            for p, b in zip(trunk, backups):
-                p.copy_(b)
-        _restore_named_buffers(model, buf_snap)
         model.train(was_training)
 
 
