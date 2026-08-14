@@ -134,7 +134,7 @@ def flatten_param_grads(params, grads) -> torch.Tensor:
     chunks = []
     for p, g in zip(params, grads):
         if g is None:
-            chunks.append(torch.zeros(p.numel(), device=p.device, dtype=torch.float32))
+            chunks.append(torch.zeros(p.numel(), dtype=torch.float32))
         else:
             chunks.append(g.detach().float().reshape(-1).cpu())
     if not chunks:
