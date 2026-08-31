@@ -18,6 +18,8 @@ if str(ROOT) not in sys.path:
 from mattergen.assignment.global_copy_assembly.orbit_membership import build_orbit_partition
 from mattergen.assignment.joint_assignment_diffusion.ctmc import simulate_forward_ctmc
 from mattergen.assignment.joint_assignment_diffusion.geometry_ablation import (
+    CLEAN_G_CONSTRUCTION,
+    CLEAN_G_NOT,
     ORACLE_G_CONSTRUCTION,
     ORACLE_G_NOT,
     resolve_geometry_ablation_arm,
@@ -143,7 +145,7 @@ def main() -> None:
         "--ablation-arm",
         type=str,
         default=None,
-        help="original | oracle_g | g_conditioned. original/oracle_g are L_geom-only.",
+        help="original | oracle_g | clean_g | g_conditioned. original/oracle_g/clean_g are L_geom-only.",
     )
     p.add_argument(
         "--train-assignment-heads",
@@ -206,6 +208,7 @@ def main() -> None:
     train_assignment = bool(ablation["train_assignment_heads"])
     ablation_arm = str(ablation["ablation_arm"])
     oracle_g = bool(ablation["oracle_g"])
+    clean_g = bool(ablation.get("clean_g", False))
     model = JointAXLModel(
         denoiser,
         num_orbits=partition.J,
@@ -267,17 +270,26 @@ def main() -> None:
         "TRAIN_ASSIGNMENT_HEADS": train_assignment,
         "ABLATION_ARM": ablation_arm,
         "ORACLE_G": oracle_g,
+        "CLEAN_G": clean_g,
         "ORACLE_G_CONSTRUCTION": ORACLE_G_CONSTRUCTION if oracle_g else "n/a",
         "ORACLE_G_NOT": ORACLE_G_NOT if oracle_g else "n/a",
+        "CLEAN_G_CONSTRUCTION": CLEAN_G_CONSTRUCTION if clean_g else "n/a",
+        "CLEAN_G_NOT": CLEAN_G_NOT if clean_g else "n/a",
         "G_GEOMETRY_PATH": (
-            "oracle A_t=forward_CTMC(GT A_0).state_at(t) -> C/copy_of -> SCF "
-            "node_delta+edge_adapter+mid_block -> pos/cell scores; L_geom only"
-            if oracle_g
+            "clean A_0^GT (symmetry-augmented) -> C/copy_of -> SCF "
+            "node_delta+edge_adapter+mid_block -> pos/cell scores; L_geom only; "
+            "never traj.state_at(t)"
+            if clean_g
             else (
-                "G/copy_of+C -> spatial_edge/assign_mp/copy_pool -> GemNet scf "
-                "node_delta+edge_adapter+mid_block -> pos/cell scores"
-                if geom_cond
-                else "original GemNet (scf.enabled=False); assignment not consumed by geometry"
+                "oracle A_t=forward_CTMC(GT A_0).state_at(t) -> C/copy_of -> SCF "
+                "node_delta+edge_adapter+mid_block -> pos/cell scores; L_geom only"
+                if oracle_g
+                else (
+                    "G/copy_of+C -> spatial_edge/assign_mp/copy_pool -> GemNet scf "
+                    "node_delta+edge_adapter+mid_block -> pos/cell scores"
+                    if geom_cond
+                    else "original GemNet (scf.enabled=False); assignment not consumed by geometry"
+                )
             )
         ),
         "REVERSE_LOOP": "A-first Lie: Gillespie A on (s,t] writes state_s; geometry score uses state_s",
@@ -291,6 +303,7 @@ def main() -> None:
                 "event": "geometry_ablation_arm",
                 **ablation,
                 "oracle_construction": ORACLE_G_CONSTRUCTION if oracle_g else "n/a",
+                "clean_g_construction": CLEAN_G_CONSTRUCTION if clean_g else "n/a",
                 "L_G": "computed" if train_assignment else 0,
                 "L_R": "computed" if train_assignment else 0,
             },
@@ -445,12 +458,16 @@ def main() -> None:
 
             if picked is not None:
                 t_f = float(picked.time)
-                state_t = traj.state_at(t_f)  # A_{τ+}
+                state_t = traj.state_at(t_f)  # A_{τ+}  (noisy trajectory; not used by Clean-G SCF)
             else:
                 t_focus = "U"
                 t_ten = noise.sample_t(1, device=device)
                 t_f = float(t_ten.reshape(-1)[0].item())
                 state_t = traj.state_at(t_f)
+            # Clean-G: SCF always sees symmetry-augmented GT A_0. CTMC still runs so
+            # X_t/L_t / t sampling stay paired with Original. Original ignores state
+            # (SCF off). Trajectory-oracle uses noisy state_t.
+            state_cond = st0 if clean_g else state_t
 
             t = torch.tensor([t_f], device=device, dtype=torch.float32)
             noisy = noise.corrupt_fixed_sample(
@@ -621,7 +638,7 @@ def main() -> None:
                     clean_cg=clean_cg,
                     noisy_cg=noisy_cg,
                     t=noisy.t,
-                    state_at_t=state_t,
+                    state_at_t=state_cond,
                 )
                 L_geom = geom["L_geom"]
                 geom_field = {k: geom[k] for k in geom if k.startswith("geom_")}
@@ -660,7 +677,12 @@ def main() -> None:
                 "geometry_assignment_conditioning": float(geom_cond),
                 "ablation_arm": ablation_arm,
                 "oracle_g": float(oracle_g),
+                "clean_g": float(clean_g),
                 "train_assignment_heads": float(train_assignment),
+                "scf_uses_clean_a0": float(clean_g),
+                "cond_equals_clean_a0": float(bool(torch.equal(state_cond.A, st0.A))),
+                "cond_equals_noisy_At": float(bool(torch.equal(state_cond.A, state_t.A))),
+                "cond_legal": float(bool(state_cond.validate()["legal"])),
                 "CE_R": float(ce_r.detach()),
                 "CE_G": float(ce_g.detach()),
                 "L_R": float(ce_r.detach()),

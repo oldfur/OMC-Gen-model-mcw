@@ -146,9 +146,9 @@ class JointAXLModel(nn.Module):
     ) -> tuple[dict, dict]:
         """Build soft_c_feedback-compatible conditioning dict for GemNet.
 
-        ``state`` is caller-supplied. Oracle-G training passes
-        ``A_t = forward_CTMC(GT A_0).state_at(t)``. This path never reads
-        GJumpHead / RJumpHead outputs.
+        ``state`` is caller-supplied. Trajectory-oracle passes
+        ``A_t = forward_CTMC(GT A_0).state_at(t)``. Clean-G passes
+        ``A_0^GT`` at every t. This path never reads GJumpHead / RJumpHead outputs.
         """
         z_orbit = self.orbit_encoder(state.element_by_orbit.to(state.A.device))
         orbit_of = state.orbit_of()

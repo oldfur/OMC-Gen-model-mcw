@@ -831,6 +831,13 @@ def test_resolve_geometry_ablation_arm_original_vs_oracle_g():
         geometry_assignment_conditioning=True, train_assignment_heads=False
     )
     assert implied["ablation_arm"] == "oracle_g"
+    clean = resolve_geometry_ablation_arm(ablation_arm="clean_g")
+    assert clean["geometry_assignment_conditioning"] is True
+    assert clean["train_assignment_heads"] is False
+    assert clean["oracle_g"] is False
+    assert clean["clean_g"] is True
+    assert orig.get("clean_g") is False
+    assert oracle.get("clean_g") is False
 
 
 def test_oracle_assignment_is_forward_of_gt_not_clean_g0():
@@ -850,3 +857,23 @@ def test_oracle_assignment_is_forward_of_gt_not_clean_g0():
     st_early, _ = oracle_assignment_at_t(st0, schedule=schedule, t=0.0, generator=g0)
     # t=0 must be the GT assignment (no forward mass yet).
     assert torch.equal(st_early.A, st0.A)
+
+
+def test_clean_g_conditioning_is_a0_not_forward_at():
+    """Clean-G SCF state is A_0, even when a forward trajectory has already jumped."""
+    from mattergen.assignment.joint_assignment_diffusion.ctmc import simulate_forward_ctmc
+    from mattergen.assignment.joint_assignment_diffusion.schedule import AsyncJumpSchedule
+
+    st0, _, _ = _toy_state()
+    g = torch.Generator()
+    g.manual_seed(0)
+    traj = simulate_forward_ctmc(st0, schedule=AsyncJumpSchedule(), generator=g)
+    state_t = traj.state_at(0.6)
+    # Training Clean-G sets state_cond = st0, never state_t.
+    state_cond = st0
+    assert torch.equal(state_cond.A, st0.A)
+    if traj.events:
+        # After jumps, noisy A_t must not be the conditioning state.
+        jumped = any(e.time <= 0.6 for e in traj.events)
+        if jumped:
+            assert not torch.equal(state_t.A, state_cond.A)

@@ -26,9 +26,11 @@ joint_j1:
   g_relation_detach_trunk: false
   # G→geometry causal ablation: true = A/G features enter GemNet SCF; false = original X/L
   geometry_assignment_conditioning: true
-  # Oracle-G upper bound: ablation_arm=oracle_g (CLI) => SCF on, L_geom only, A_t=forward(GT)
-  # original => SCF off, L_geom only. Do not set these for default J1 learned-G training.
-  # ablation_arm: original | oracle_g | g_conditioned
+  # Geometry ablations (CLI --ablation-arm). Do not set for default J1 learned-G training.
+  # original: SCF off, L_geom only
+  # oracle_g: SCF on, L_geom only, A_t = forward(GT)
+  # clean_g:  SCF on, L_geom only, A_cond = A_0^GT at every t (never noisy A_t)
+  # ablation_arm: original | oracle_g | clean_g | g_conditioned
   # train_assignment_heads: true
 
   loss:
