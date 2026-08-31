@@ -789,3 +789,23 @@ def test_trunk_rg_interference_metrics_and_forgetting():
     assert inter["all"]["n"] == 2
     assert inter["early"]["n"] == 1
     assert inter["late"]["n"] == 1
+
+
+def test_crystal_geometry_clash_metric():
+    from mattergen.assignment.joint_assignment_diffusion.metrics import crystal_geometry_vs_target
+
+    frac = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]])
+    cell = torch.eye(3) * 10.0
+    ok = crystal_geometry_vs_target(frac, cell, frac, cell)
+    assert ok["no_clash"]
+    close = torch.tensor([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
+    bad = crystal_geometry_vs_target(close, cell, frac, cell)
+    assert not bad["no_clash"]
+
+
+def test_geometry_assignment_conditioning_flag_on_model_signature():
+    import inspect
+    from mattergen.assignment.joint_assignment_diffusion.joint_model import JointAXLModel
+
+    sig = inspect.signature(JointAXLModel.__init__)
+    assert "geometry_assignment_conditioning" in sig.parameters

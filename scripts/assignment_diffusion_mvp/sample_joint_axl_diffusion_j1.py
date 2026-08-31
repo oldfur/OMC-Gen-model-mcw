@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 from mattergen.assignment.global_copy_assembly.orbit_membership import build_orbit_partition
 from mattergen.assignment.joint_assignment_diffusion.joint_model import JointAXLModel
 from mattergen.assignment.joint_assignment_diffusion.metrics import (
+    crystal_geometry_vs_target,
     jump_budget_diagnostics,
     lock_schedule_checks,
     trajectory_legality,
@@ -76,6 +77,7 @@ def main() -> None:
     p.add_argument("--mattergen-model-path", type=str, default=None)
     p.add_argument("--mattergen-load-epoch", type=int, default=None)
     p.add_argument("--mattergen-checkpoint", type=str, default=None)
+    p.add_argument("--geometry-assignment-conditioning", type=str, default=None)
     args = p.parse_args()
     if not args.execute:
         raise SystemExit("Refusing without --execute")
@@ -102,12 +104,18 @@ def main() -> None:
     schedule = AsyncJumpSchedule.from_config(cfg.get("schedule") or {})
     g_ctx = str(cfg.get("g_copy_context_mode") or "template_counterfactual")
     g_detach = bool(cfg.get("g_relation_detach_trunk", True))
+    geom_cond = cfg.get("geometry_assignment_conditioning", True)
+    if args.geometry_assignment_conditioning is not None:
+        geom_cond = args.geometry_assignment_conditioning
+    if not isinstance(geom_cond, bool):
+        geom_cond = str(geom_cond).strip().lower() not in ("0", "false", "no", "off")
     model = JointAXLModel(
         bundle.denoiser.to(device),
         num_orbits=partition.J,
         schedule=schedule,
         g_copy_context_mode=g_ctx,
         g_relation_detach_trunk=g_detach,
+        geometry_assignment_conditioning=geom_cond,
     ).to(device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["joint_state_dict"], strict=False)
@@ -147,6 +155,13 @@ def main() -> None:
             locks = lock_schedule_checks(ctmc, schedule)
             budget = jump_budget_diagnostics(ctmc, schedule)
             final = traj.assignments[-1]
+            geo_m = crystal_geometry_vs_target(
+                traj.frac_list[-1].detach().cpu(),
+                traj.cell_list[-1].detach().cpu(),
+                sample["pos"].detach().cpu(),
+                sample["cell"].detach().cpu(),
+                copy_of=final.copy_of().detach().cpu(),
+            )
             row = {
                 "assignment_mode": mode,
                 "sample_index": si,
@@ -163,6 +178,8 @@ def main() -> None:
                 "ratio_R_vs_segment": budget["ratio_R_vs_segment"],
                 "ratio_G_vs_segment": budget["ratio_G_vs_segment"],
                 "jumps_per_bin": traj.diagnostics.get("jumps_per_bin", {}),
+                "geometry_assignment_conditioning": bool(geom_cond),
+                **{k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v) for k, v in geo_m.items()},
                 **leg,
                 **locks,
             }

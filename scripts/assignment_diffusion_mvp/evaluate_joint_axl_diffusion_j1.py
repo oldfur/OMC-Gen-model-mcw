@@ -53,6 +53,7 @@ def main() -> None:
     p.add_argument("--mattergen-model-path", type=str, default=None)
     p.add_argument("--mattergen-load-epoch", type=int, default=None)
     p.add_argument("--mattergen-checkpoint", type=str, default=None)
+    p.add_argument("--geometry-assignment-conditioning", type=str, default=None)
     args = p.parse_args()
     if not args.execute:
         raise SystemExit("Refusing without --execute")
@@ -79,12 +80,22 @@ def main() -> None:
     schedule = AsyncJumpSchedule.from_config(cfg.get("schedule") or {})
     g_ctx = str(cfg.get("g_copy_context_mode") or "template_counterfactual")
     g_detach = bool(cfg.get("g_relation_detach_trunk", True))
+    geom_raw = (
+        args.geometry_assignment_conditioning
+        if args.geometry_assignment_conditioning is not None
+        else cfg.get("geometry_assignment_conditioning", True)
+    )
+    if isinstance(geom_raw, bool):
+        geom_cond = geom_raw
+    else:
+        geom_cond = str(geom_raw).strip().lower() not in ("0", "false", "no", "off")
     model = JointAXLModel(
         bundle.denoiser.to(device),
         num_orbits=partition.J,
         schedule=schedule,
         g_copy_context_mode=g_ctx,
         g_relation_detach_trunk=g_detach,
+        geometry_assignment_conditioning=geom_cond,
     ).to(device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["joint_state_dict"], strict=False)

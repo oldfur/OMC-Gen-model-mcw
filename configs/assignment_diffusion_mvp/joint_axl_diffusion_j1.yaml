@@ -24,6 +24,8 @@ joint_j1:
   g_copy_context_mode: template_counterfactual
   # B3 detach=true | B4 coupled mirror: false (only experimental variable)
   g_relation_detach_trunk: false
+  # G→geometry causal ablation: true = learned G/A conditions GemNet; false = original X/L
+  geometry_assignment_conditioning: true
 
   loss:
     lambda_r: 1.0

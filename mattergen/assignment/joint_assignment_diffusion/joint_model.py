@@ -54,6 +54,7 @@ class JointAXLModel(nn.Module):
         schedule: AsyncJumpSchedule | None = None,
         g_copy_context_mode: str = "mean",
         g_relation_detach_trunk: bool = True,
+        geometry_assignment_conditioning: bool = True,
     ):
         super().__init__()
         self.denoiser = denoiser
@@ -61,6 +62,7 @@ class JointAXLModel(nn.Module):
         self.schedule = schedule or AsyncJumpSchedule()
         self.g_copy_context_mode = str(g_copy_context_mode or "mean")
         self.g_relation_detach_trunk = bool(g_relation_detach_trunk)
+        self.geometry_assignment_conditioning = bool(geometry_assignment_conditioning)
         self.orbit_encoder = OrbitSiteEncoder(hidden=self.hidden)
         self.orbit_to_node = nn.Sequential(
             nn.Linear(self.hidden, self.hidden),
@@ -182,11 +184,14 @@ class JointAXLModel(nn.Module):
             return delta + self.copy_to_node(c_i)
 
         scf = {
-            "enabled": True,
+            "enabled": bool(self.geometry_assignment_conditioning),
             "node_delta": node_delta,
             "edge_adapter": edge_adapter,
             "mid_block_node_fn": mid_block_node_fn,
         }
+        if not self.geometry_assignment_conditioning:
+            # Original geometry path: GemNet sees no assignment-derived residuals.
+            scf = {"enabled": False}
         meta = {
             "beta_r": beta_r,
             "beta_g": beta_g,
@@ -196,6 +201,7 @@ class JointAXLModel(nn.Module):
             "copy_of": copy_of,
             "C": C,
             "clock": clock,
+            "geometry_assignment_conditioning": bool(self.geometry_assignment_conditioning),
         }
         return scf, meta
 

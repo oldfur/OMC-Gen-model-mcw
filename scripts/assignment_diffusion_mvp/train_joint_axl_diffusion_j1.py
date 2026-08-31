@@ -128,6 +128,12 @@ def main() -> None:
     p.add_argument("--mattergen-model-path", type=str, default=None)
     p.add_argument("--mattergen-load-epoch", type=int, default=None)
     p.add_argument("--mattergen-checkpoint", type=str, default=None)
+    p.add_argument(
+        "--geometry-assignment-conditioning",
+        type=str,
+        default=None,
+        help="true/false; overrides yaml. false = original GemNet (no G/A features in geometry).",
+    )
     args = p.parse_args()
     if not args.execute:
         raise SystemExit("Refusing without --execute")
@@ -162,12 +168,26 @@ def main() -> None:
     schedule = AsyncJumpSchedule.from_config(sch_cfg)
     g_ctx = str(cfg.get("g_copy_context_mode") or "template_counterfactual")
     g_detach = bool(cfg.get("g_relation_detach_trunk", True))
+    def _as_bool(v, default=True):
+        if v is None:
+            return bool(default)
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+    geom_cond = _as_bool(
+        args.geometry_assignment_conditioning
+        if args.geometry_assignment_conditioning is not None
+        else cfg.get("geometry_assignment_conditioning", True),
+        True,
+    )
     model = JointAXLModel(
         denoiser,
         num_orbits=partition.J,
         schedule=schedule,
         g_copy_context_mode=g_ctx,
         g_relation_detach_trunk=g_detach,
+        geometry_assignment_conditioning=geom_cond,
     ).to(device)
     sample_d = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in sample.items()}
     model.set_orbit_relations(partition, sample_d["role_edge_index"], sample_d["role_bond_type"])
@@ -216,6 +236,16 @@ def main() -> None:
         "NOISE_SOURCE": PROVENANCE["noise_source"],
         "LIE_SPLITTING": "A_first_same_t",
         "SAMPLE": sample["id"],
+        "GEOMETRY_ASSIGNMENT_CONDITIONING": geom_cond,
+        "ABLATION_ARM": "g_conditioned" if geom_cond else "original",
+        "G_GEOMETRY_PATH": (
+            "G/copy_of+C -> spatial_edge/assign_mp/copy_pool -> GemNet scf "
+            "node_delta+edge_adapter+mid_block -> pos/cell scores"
+            if geom_cond
+            else "original GemNet (scf.enabled=False); G not consumed by geometry"
+        ),
+        "REVERSE_LOOP": "A-first Lie: Gillespie A on (s,t] writes state_s; geometry score uses state_s",
+        "HEADS": "GJumpHead (categorical G) separate from GemNet forces/stress (X,L)",
     }
     (out / "runtime_provenance.json").write_text(json.dumps(prov, indent=2, default=str))
     print(json.dumps({"event": "j1_start", **prov}), flush=True)
@@ -407,7 +437,8 @@ def main() -> None:
             ce_r = torch.zeros((), device=device)
             ce_g = torch.zeros((), device=device)
             ev_diag: dict = {}
-            if picked is not None:
+            geom_field: dict = {}
+            if picked is not None and geom_cond:
                 if picked.kind == "G" and g_sup == "improvement_weighted":
                     ev_diag = event_conditioned_g_teacher_ce(
                         model=model,
@@ -438,6 +469,7 @@ def main() -> None:
                     score_model_output=ev_diag["chemgraph_scores"],
                     t=torch.as_tensor(noisy.t, dtype=torch.float32, device=device).reshape(-1),
                 )
+                geom_field = dict(_gmet)
                 if picked.kind == "R":
                     ce_r = ev_diag["CE"]
                 else:
@@ -541,6 +573,7 @@ def main() -> None:
                     state_at_t=state_t,
                 )
                 L_geom = geom["L_geom"]
+                geom_field = {k: geom[k] for k in geom if k.startswith("geom_")}
             if picked is not None and picked.kind == "G":
                 iso = isolation_grad_norms(model, ce_g)
                 ev_diag.update(iso)
@@ -573,6 +606,8 @@ def main() -> None:
                 "has_event_target": picked is not None,
                 "event_kind": None if picked is None else picked.kind,
                 "geometry_loss": float(L_geom.detach()),
+                "geometry_assignment_conditioning": float(geom_cond),
+                "ablation_arm": "g_conditioned" if geom_cond else "original",
                 "CE_R": float(ce_r.detach()),
                 "CE_G": float(ce_g.detach()),
                 "L_R": float(ce_r.detach()),
@@ -610,6 +645,11 @@ def main() -> None:
                 "delta_G_LR": float(ev_diag.get("delta_G_LR", 0.0)) if ev_diag else 0.0,
                 "destructive_dominant": float(ev_diag.get("destructive_dominant", 0.0)) if ev_diag else 0.0,
             }
+            for gk, gv in geom_field.items():
+                if torch.is_tensor(gv):
+                    row[gk] = float(gv.detach())
+                elif isinstance(gv, (int, float)):
+                    row[gk] = float(gv)
             stream.write(json.dumps(row) + "\n")
             if step % log_every == 0 or step + 1 == steps:
                 print(json.dumps(row), flush=True)
@@ -649,6 +689,37 @@ def main() -> None:
             for rec in event_records:
                 ef.write(json.dumps(rec) + "\n")
         print(json.dumps({"event": "b4_audit_summary", "detach": g_detach, **inter_sum.get("all", {}), **forget}), flush=True)
+        try:
+            gtrace = []
+            with (out / "training_trace.jsonl").open() as tf:
+                for line in tf:
+                    if line.strip():
+                        gtrace.append(json.loads(line))
+            buckets = {"[0.0,0.2)": [], "[0.2,0.4)": [], "[0.4,0.6)": [], "[0.6,0.8)": [], "[0.8,1.0]": []}
+            for r in gtrace:
+                t = float(r.get("global_t", -1))
+                gl = float(r.get("geometry_loss", 0.0))
+                key = (
+                    "[0.0,0.2)" if t < 0.2 else
+                    "[0.2,0.4)" if t < 0.4 else
+                    "[0.4,0.6)" if t < 0.6 else
+                    "[0.6,0.8)" if t < 0.8 else
+                    "[0.8,1.0]"
+                )
+                buckets[key].append(gl)
+            geom_sum = {
+                k: {"n": len(v), "geometry_loss_mean": (sum(v) / len(v) if v else 0.0)}
+                for k, v in buckets.items()
+            }
+            geom_sum["overall"] = {
+                "n": len(gtrace),
+                "geometry_loss_mean": (
+                    sum(float(r.get("geometry_loss", 0.0)) for r in gtrace) / max(1, len(gtrace))
+                ),
+            }
+            (out / "geometry_bin_summary.json").write_text(json.dumps(geom_sum, indent=2))
+        except Exception:
+            pass
     except Exception as exc:
         print(json.dumps({"event": "j1_diag_dump_failed", "error": str(exc)}), flush=True)
     print(json.dumps({"event": "j1_train_done", "output": str(out), "n_event_targets": len(event_records)}), flush=True)

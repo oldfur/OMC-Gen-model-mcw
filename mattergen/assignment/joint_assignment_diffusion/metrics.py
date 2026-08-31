@@ -115,3 +115,61 @@ def assignment_vs_target(state: JointAssignmentState, target: JointAssignmentSta
         "ARI": float(ari),
         "orbit_atom_accuracy": orbit_acc,
     }
+
+
+def pbc_min_dist(frac: torch.Tensor, cell: torch.Tensor) -> float:
+    """Minimum-image pairwise distance (self excluded)."""
+    n = int(frac.shape[0])
+    if n < 2:
+        return float("inf")
+    if cell.ndim == 3:
+        cell = cell.reshape(-1, 3, 3)[0]
+    delta = frac[:, None, :] - frac[None, :, :]
+    delta = delta - torch.round(delta)
+    dist = torch.linalg.norm(delta @ cell, dim=-1)
+    dist = dist + torch.eye(n, device=dist.device, dtype=dist.dtype) * 1e9
+    return float(dist.min().item())
+
+
+def crystal_geometry_vs_target(
+    frac: torch.Tensor,
+    cell: torch.Tensor,
+    target_frac: torch.Tensor,
+    target_cell: torch.Tensor,
+    *,
+    copy_of: torch.Tensor | None = None,
+    min_dist_cutoff: float = 0.7,
+    density_range: tuple[float, float] = (0.04, 0.25),
+) -> dict[str, float | bool]:
+    """Existing crystal-generation sanity: clash, density, volume vs clean target."""
+    cell = cell.reshape(3, 3) if cell.numel() == 9 else cell.reshape(-1, 3, 3)[0]
+    tcell = target_cell.reshape(3, 3) if target_cell.numel() == 9 else target_cell.reshape(-1, 3, 3)[0]
+    n = int(frac.shape[0])
+    vol = abs(float(torch.det(cell).item()))
+    tvol = abs(float(torch.det(tcell).item()))
+    dens = n / vol if vol > 1e-12 else float("inf")
+    tdens = n / tvol if tvol > 1e-12 else float("inf")
+    mind = pbc_min_dist(frac, cell) if vol > 1e-12 else 0.0
+    inter = None
+    if copy_of is not None and int(copy_of.max().item()) > int(copy_of.min().item()):
+        # min distance between different copies (intermolecular contact)
+        k = copy_of.long()
+        delta = frac[:, None, :] - frac[None, :, :]
+        delta = delta - torch.round(delta)
+        dist = torch.linalg.norm(delta @ cell, dim=-1)
+        mask = k[:, None] != k[None, :]
+        if bool(mask.any()):
+            inter = float(dist[mask].min().item())
+    no_clash = mind >= float(min_dist_cutoff)
+    valid_cell = density_range[0] <= dens <= density_range[1]
+    return {
+        "volume": vol,
+        "atom_density": dens,
+        "min_dist": mind,
+        "no_clash": bool(no_clash),
+        "valid_cell": bool(valid_cell),
+        "pass_basic": bool(valid_cell and no_clash),
+        "volume_ratio": (vol / tvol) if tvol > 1e-12 else float("nan"),
+        "density_ratio": (dens / tdens) if tdens > 0 and tdens != float("inf") else float("nan"),
+        "inter_copy_min_dist": float(inter) if inter is not None else float("nan"),
+    }
