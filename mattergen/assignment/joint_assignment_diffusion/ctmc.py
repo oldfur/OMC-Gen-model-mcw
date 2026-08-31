@@ -149,3 +149,23 @@ def simulate_forward_ctmc(
         times.append(t_end)
         states.append(state.clone())
     return CTMCTrajectory(times=times, states=states, events=events)
+
+
+def oracle_assignment_at_t(
+    state0: JointAssignmentState,
+    *,
+    schedule: AsyncJumpSchedule,
+    t: float,
+    generator: torch.Generator | None = None,
+) -> tuple[JointAssignmentState, CTMCTrajectory]:
+    """Oracle A_t for geometry SCF: GT A_0 through the known forward CTMC.
+
+    ``state0`` is the clean target assignment (G_0 / A_0 from the crystal's
+    true role/copy).  The returned state is ``traj.state_at(t)``, i.e. the
+    same forward corruption used for training X_t/L_t — not GJumpHead output
+    and not clean G_0 reused at t>0 (unless no jumps have occurred yet).
+    """
+    traj = simulate_forward_ctmc(
+        state0, schedule=schedule, t_start=0.0, t_end=1.0, generator=generator
+    )
+    return traj.state_at(float(t)), traj

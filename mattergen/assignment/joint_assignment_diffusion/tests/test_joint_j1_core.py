@@ -809,3 +809,44 @@ def test_geometry_assignment_conditioning_flag_on_model_signature():
 
     sig = inspect.signature(JointAXLModel.__init__)
     assert "geometry_assignment_conditioning" in sig.parameters
+
+
+def test_resolve_geometry_ablation_arm_original_vs_oracle_g():
+    from mattergen.assignment.joint_assignment_diffusion.geometry_ablation import (
+        resolve_geometry_ablation_arm,
+    )
+
+    orig = resolve_geometry_ablation_arm(ablation_arm="original")
+    assert orig["geometry_assignment_conditioning"] is False
+    assert orig["train_assignment_heads"] is False
+    assert orig["oracle_g"] is False
+    oracle = resolve_geometry_ablation_arm(ablation_arm="oracle_g")
+    assert oracle["geometry_assignment_conditioning"] is True
+    assert oracle["train_assignment_heads"] is False
+    assert oracle["oracle_g"] is True
+    learned = resolve_geometry_ablation_arm(ablation_arm="g_conditioned")
+    assert learned["train_assignment_heads"] is True
+    # geom on + no assignment heads ⇒ oracle-G, not learned G
+    implied = resolve_geometry_ablation_arm(
+        geometry_assignment_conditioning=True, train_assignment_heads=False
+    )
+    assert implied["ablation_arm"] == "oracle_g"
+
+
+def test_oracle_assignment_is_forward_of_gt_not_clean_g0():
+    from mattergen.assignment.joint_assignment_diffusion.ctmc import oracle_assignment_at_t
+    from mattergen.assignment.joint_assignment_diffusion.schedule import AsyncJumpSchedule
+
+    st0, _, _ = _toy_state()
+    g = torch.Generator()
+    g.manual_seed(0)
+    schedule = AsyncJumpSchedule()
+    st_t, traj = oracle_assignment_at_t(st0, schedule=schedule, t=0.6, generator=g)
+    assert traj.times[0] == 0.0
+    # Oracle at t is the CTMC state, not a jump-head prediction.
+    assert st_t.validate()["legal"]
+    g0 = torch.Generator()
+    g0.manual_seed(1)
+    st_early, _ = oracle_assignment_at_t(st0, schedule=schedule, t=0.0, generator=g0)
+    # t=0 must be the GT assignment (no forward mass yet).
+    assert torch.equal(st_early.A, st0.A)

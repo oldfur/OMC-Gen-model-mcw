@@ -144,7 +144,12 @@ class JointAXLModel(nn.Module):
         *,
         t_scalar: float,
     ) -> tuple[dict, dict]:
-        """Build soft_c_feedback-compatible conditioning dict for GemNet."""
+        """Build soft_c_feedback-compatible conditioning dict for GemNet.
+
+        ``state`` is caller-supplied. Oracle-G training passes
+        ``A_t = forward_CTMC(GT A_0).state_at(t)``. This path never reads
+        GJumpHead / RJumpHead outputs.
+        """
         z_orbit = self.orbit_encoder(state.element_by_orbit.to(state.A.device))
         orbit_of = state.orbit_of()
         copy_of = state.copy_of()

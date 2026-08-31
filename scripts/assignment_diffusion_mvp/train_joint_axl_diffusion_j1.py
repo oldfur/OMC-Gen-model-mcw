@@ -17,6 +17,11 @@ if str(ROOT) not in sys.path:
 
 from mattergen.assignment.global_copy_assembly.orbit_membership import build_orbit_partition
 from mattergen.assignment.joint_assignment_diffusion.ctmc import simulate_forward_ctmc
+from mattergen.assignment.joint_assignment_diffusion.geometry_ablation import (
+    ORACLE_G_CONSTRUCTION,
+    ORACLE_G_NOT,
+    resolve_geometry_ablation_arm,
+)
 from mattergen.assignment.joint_assignment_diffusion.joint_model import JointAXLModel
 from mattergen.assignment.joint_assignment_diffusion.legal_moves import enumerate_r_moves
 from mattergen.assignment.joint_assignment_diffusion.losses import (
@@ -134,6 +139,18 @@ def main() -> None:
         default=None,
         help="true/false; overrides yaml. false = original GemNet (no G/A features in geometry).",
     )
+    p.add_argument(
+        "--ablation-arm",
+        type=str,
+        default=None,
+        help="original | oracle_g | g_conditioned. original/oracle_g are L_geom-only.",
+    )
+    p.add_argument(
+        "--train-assignment-heads",
+        type=str,
+        default=None,
+        help="true/false; false => L_G=L_R=0 (Oracle-G / Original). Default follows the arm.",
+    )
     args = p.parse_args()
     if not args.execute:
         raise SystemExit("Refusing without --execute")
@@ -168,19 +185,27 @@ def main() -> None:
     schedule = AsyncJumpSchedule.from_config(sch_cfg)
     g_ctx = str(cfg.get("g_copy_context_mode") or "template_counterfactual")
     g_detach = bool(cfg.get("g_relation_detach_trunk", True))
-    def _as_bool(v, default=True):
-        if v is None:
-            return bool(default)
-        if isinstance(v, bool):
-            return v
-        return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-    geom_cond = _as_bool(
-        args.geometry_assignment_conditioning
-        if args.geometry_assignment_conditioning is not None
-        else cfg.get("geometry_assignment_conditioning", True),
-        True,
+    yaml_geom = cfg.get("geometry_assignment_conditioning", True)
+    if isinstance(yaml_geom, str):
+        yaml_geom = yaml_geom.strip().lower() in ("1", "true", "yes", "on")
+    ablation = resolve_geometry_ablation_arm(
+        ablation_arm=args.ablation_arm or cfg.get("ablation_arm"),
+        geometry_assignment_conditioning=(
+            args.geometry_assignment_conditioning
+            if args.geometry_assignment_conditioning is not None
+            else None
+        ),
+        train_assignment_heads=(
+            args.train_assignment_heads
+            if args.train_assignment_heads is not None
+            else cfg.get("train_assignment_heads")
+        ),
+        yaml_geom_cond=bool(yaml_geom),
     )
+    geom_cond = bool(ablation["geometry_assignment_conditioning"])
+    train_assignment = bool(ablation["train_assignment_heads"])
+    ablation_arm = str(ablation["ablation_arm"])
+    oracle_g = bool(ablation["oracle_g"])
     model = JointAXLModel(
         denoiser,
         num_orbits=partition.J,
@@ -212,7 +237,9 @@ def main() -> None:
     prov = {
         "J1_MODE": "joint_axl_ctmc_j1_1",
         "RATE_MODEL": "fixed_exit_beta_softmax",
-        "ASSIGNMENT_LOSS": "event_conditioned_reverse_ce",
+        "ASSIGNMENT_LOSS": (
+            "event_conditioned_reverse_ce" if train_assignment else "none_L_geom_only"
+        ),
         "JOINT_TIME": "single_global_tau_or_t",
         "J1_2": "event_conditioned_assignment",
         "J1_3A": "improvement_weighted_g_teacher",
@@ -237,18 +264,40 @@ def main() -> None:
         "LIE_SPLITTING": "A_first_same_t",
         "SAMPLE": sample["id"],
         "GEOMETRY_ASSIGNMENT_CONDITIONING": geom_cond,
-        "ABLATION_ARM": "g_conditioned" if geom_cond else "original",
+        "TRAIN_ASSIGNMENT_HEADS": train_assignment,
+        "ABLATION_ARM": ablation_arm,
+        "ORACLE_G": oracle_g,
+        "ORACLE_G_CONSTRUCTION": ORACLE_G_CONSTRUCTION if oracle_g else "n/a",
+        "ORACLE_G_NOT": ORACLE_G_NOT if oracle_g else "n/a",
         "G_GEOMETRY_PATH": (
-            "G/copy_of+C -> spatial_edge/assign_mp/copy_pool -> GemNet scf "
-            "node_delta+edge_adapter+mid_block -> pos/cell scores"
-            if geom_cond
-            else "original GemNet (scf.enabled=False); G not consumed by geometry"
+            "oracle A_t=forward_CTMC(GT A_0).state_at(t) -> C/copy_of -> SCF "
+            "node_delta+edge_adapter+mid_block -> pos/cell scores; L_geom only"
+            if oracle_g
+            else (
+                "G/copy_of+C -> spatial_edge/assign_mp/copy_pool -> GemNet scf "
+                "node_delta+edge_adapter+mid_block -> pos/cell scores"
+                if geom_cond
+                else "original GemNet (scf.enabled=False); assignment not consumed by geometry"
+            )
         ),
         "REVERSE_LOOP": "A-first Lie: Gillespie A on (s,t] writes state_s; geometry score uses state_s",
         "HEADS": "GJumpHead (categorical G) separate from GemNet forces/stress (X,L)",
     }
     (out / "runtime_provenance.json").write_text(json.dumps(prov, indent=2, default=str))
     print(json.dumps({"event": "j1_start", **prov}), flush=True)
+    print(
+        json.dumps(
+            {
+                "event": "geometry_ablation_arm",
+                **ablation,
+                "oracle_construction": ORACLE_G_CONSTRUCTION if oracle_g else "n/a",
+                "L_G": "computed" if train_assignment else 0,
+                "L_R": "computed" if train_assignment else 0,
+            },
+            default=str,
+        ),
+        flush=True,
+    )
     b3_ref = {
         "g_copy_context_mode": "template_counterfactual",
         "g_supervision": "improvement_weighted",
@@ -312,7 +361,7 @@ def main() -> None:
     probe_gen.manual_seed(int(cfg.get("seed", 17)) + 1_000_003)
     r_moves0 = enumerate_r_moves(clean_state0)
     r_probe: dict | None = None
-    if r_moves0:
+    if train_assignment and r_moves0:
         rm0 = r_moves0[0]
         t_probe = torch.tensor([0.75], device=device, dtype=torch.float32)
         noisy_probe = noise.corrupt_fixed_sample(
@@ -438,7 +487,9 @@ def main() -> None:
             ce_g = torch.zeros((), device=device)
             ev_diag: dict = {}
             geom_field: dict = {}
-            if picked is not None and geom_cond:
+            # Oracle-G and Original: L_geom only. SCF still sees state_t when geom_cond.
+            # state_t is always the known forward of GT A_0, never GJumpHead.
+            if picked is not None and train_assignment:
                 if picked.kind == "G" and g_sup == "improvement_weighted":
                     ev_diag = event_conditioned_g_teacher_ce(
                         model=model,
@@ -574,7 +625,7 @@ def main() -> None:
                 )
                 L_geom = geom["L_geom"]
                 geom_field = {k: geom[k] for k in geom if k.startswith("geom_")}
-            if picked is not None and picked.kind == "G":
+            if train_assignment and picked is not None and picked.kind == "G":
                 iso = isolation_grad_norms(model, ce_g)
                 ev_diag.update(iso)
                 if r_probe is not None:
@@ -607,7 +658,9 @@ def main() -> None:
                 "event_kind": None if picked is None else picked.kind,
                 "geometry_loss": float(L_geom.detach()),
                 "geometry_assignment_conditioning": float(geom_cond),
-                "ablation_arm": "g_conditioned" if geom_cond else "original",
+                "ablation_arm": ablation_arm,
+                "oracle_g": float(oracle_g),
+                "train_assignment_heads": float(train_assignment),
                 "CE_R": float(ce_r.detach()),
                 "CE_G": float(ce_g.detach()),
                 "L_R": float(ce_r.detach()),
@@ -693,6 +746,15 @@ def main() -> None:
                     if line.strip():
                         gtrace.append(json.loads(line))
             buckets = {"[0.0,0.2)": [], "[0.2,0.4)": [], "[0.4,0.6)": [], "[0.6,0.8)": [], "[0.8,1.0]": []}
+            pos_b = {k: [] for k in buckets}
+            cell_b = {k: [] for k in buckets}
+
+            def _comp(row, names):
+                for n in names:
+                    if row.get(n) is not None:
+                        return float(row[n])
+                return None
+
             for r in gtrace:
                 t = float(r.get("global_t", -1))
                 gl = float(r.get("geometry_loss", 0.0))
@@ -704,15 +766,33 @@ def main() -> None:
                     "[0.8,1.0]"
                 )
                 buckets[key].append(gl)
-            geom_sum = {
-                k: {"n": len(v), "geometry_loss_mean": (sum(v) / len(v) if v else 0.0)}
-                for k, v in buckets.items()
-            }
+                pv = _comp(r, ("geom_pos", "pos"))
+                cv = _comp(r, ("geom_cell", "cell"))
+                if pv is not None:
+                    pos_b[key].append(pv)
+                if cv is not None:
+                    cell_b[key].append(cv)
+
+            def _pack(xs):
+                return (sum(xs) / len(xs) if xs else 0.0)
+
+            geom_sum = {}
+            for k, v in buckets.items():
+                geom_sum[k] = {
+                    "n": len(v),
+                    "geometry_loss_mean": _pack(v),
+                    "pos_loss_mean": _pack(pos_b[k]),
+                    "cell_loss_mean": _pack(cell_b[k]),
+                }
+            all_pos = [x for xs in pos_b.values() for x in xs]
+            all_cell = [x for xs in cell_b.values() for x in xs]
             geom_sum["overall"] = {
                 "n": len(gtrace),
                 "geometry_loss_mean": (
                     sum(float(r.get("geometry_loss", 0.0)) for r in gtrace) / max(1, len(gtrace))
                 ),
+                "pos_loss_mean": _pack(all_pos),
+                "cell_loss_mean": _pack(all_cell),
             }
             (out / "geometry_bin_summary.json").write_text(json.dumps(geom_sum, indent=2))
         except Exception:
