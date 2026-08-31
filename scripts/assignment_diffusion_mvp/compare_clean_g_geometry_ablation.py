@@ -35,6 +35,14 @@ def _mean(xs):
     return sum(xs) / len(xs) if xs else None
 
 
+def _num(row, key, default=0.0):
+    """Read a numeric trace flag. Do not use `x or default`: 0.0 is valid."""
+    v = row.get(key, default)
+    if v is None:
+        return float(default)
+    return float(v)
+
+
 def _tbin(t: float) -> str:
     if t < 0.2:
         return "[0.0,0.2)"
@@ -150,7 +158,7 @@ def main() -> None:
 
     def sanity():
         def always_zero(rows, key):
-            return bool(rows) and all(float(r.get(key, 0.0) or 0.0) == 0.0 for r in rows)
+            return bool(rows) and all(_num(r, key, 0.0) == 0.0 for r in rows)
 
         def total_eq_geom(rows):
             return bool(rows) and all(abs(float(r["total_loss"]) - float(r["geometry_loss"])) < 1e-6 for r in rows)
@@ -158,11 +166,11 @@ def main() -> None:
         step0_t = None
         if orig_tr and cln_tr:
             step0_t = abs(float(orig_tr[0]["global_t"]) - float(cln_tr[0]["global_t"])) < 1e-8
-        clean_uses_a0 = bool(cln_tr) and all(float(r.get("scf_uses_clean_a0", 0.0) or 0.0) == 1.0 for r in cln_tr)
-        clean_eq_a0 = bool(cln_tr) and all(float(r.get("cond_equals_clean_a0", 0.0) or 0.0) == 1.0 for r in cln_tr)
-        clean_legal = bool(cln_tr) and all(float(r.get("cond_legal", 0.0) or 0.0) == 1.0 for r in cln_tr)
+        clean_uses_a0 = bool(cln_tr) and all(_num(r, "scf_uses_clean_a0", 0.0) == 1.0 for r in cln_tr)
+        clean_eq_a0 = bool(cln_tr) and all(_num(r, "cond_equals_clean_a0", 0.0) == 1.0 for r in cln_tr)
+        clean_legal = bool(cln_tr) and all(_num(r, "cond_legal", 0.0) == 1.0 for r in cln_tr)
         # At least some steps where A_t != A_0, proving we are not accidentally only hitting t with no jumps.
-        some_at_differs = bool(cln_tr) and any(float(r.get("cond_equals_noisy_At", 1.0) or 1.0) == 0.0 for r in cln_tr)
+        some_at_differs = bool(cln_tr) and any(_num(r, "cond_equals_noisy_At", 1.0) == 0.0 for r in cln_tr)
         return {
             "orig_L_G_L_R_zero": always_zero(orig_tr, "L_G") and always_zero(orig_tr, "L_R"),
             "clean_L_G_L_R_zero": always_zero(cln_tr, "L_G") and always_zero(cln_tr, "L_R"),
