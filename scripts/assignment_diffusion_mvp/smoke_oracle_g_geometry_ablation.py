@@ -177,10 +177,23 @@ def main() -> None:
         model.zero_grad(set_to_none=True)
         out = model(cg, t, st_t, compute_jumps=False)
         dummy = out.chemgraph_scores["pos"].float().pow(2).mean() + out.chemgraph_scores["cell"].float().pow(2).mean()
-        dummy.backward()
-        g_head_gn, _ = _grad_norm(model.g_head.parameters())
-        r_head_gn, _ = _grad_norm(model.r_head.parameters())
-        adapter_gn, _ = _grad_norm(list(model.copy_to_node.parameters()) + list(model.assign_mp.parameters()))
+        # Original + frozen GemNet: SCF off ⇒ scores have no grad_fn. That is the
+        # invariant (assignment adapters are not in the geometry graph). Oracle-G
+        # must have a graph through the adapters.
+        dummy_req = bool(dummy.requires_grad and dummy.grad_fn is not None)
+        if dummy_req:
+            dummy.backward()
+            g_head_gn, _ = _grad_norm(model.g_head.parameters())
+            r_head_gn, _ = _grad_norm(model.r_head.parameters())
+            adapter_gn, _ = _grad_norm(
+                list(model.copy_to_node.parameters()) + list(model.assign_mp.parameters())
+            )
+        else:
+            if flag:
+                raise SystemExit("smoke failed: Oracle-G geometry scores have no grad_fn")
+            g_head_gn = 0.0
+            r_head_gn = 0.0
+            adapter_gn = 0.0
         rows.append(
             {
                 "arm": name,
@@ -191,6 +204,7 @@ def main() -> None:
                 "g_swap": [g_moves[0].i, g_moves[0].j],
                 "pos_score_l1_under_g_swap": dpos,
                 "compute_jumps": False,
+                "dummy_requires_grad": dummy_req,
                 "g_head_grad_norm_from_Lgeom": g_head_gn,
                 "r_head_grad_norm_from_Lgeom": r_head_gn,
                 "adapter_grad_norm_from_Lgeom": adapter_gn,
@@ -206,12 +220,14 @@ def main() -> None:
         and ora_l1 > 10.0 * max(orig_l1, 1e-12)
     )
     ok_lg_zero_graph = (
-        rows[0]["g_head_grad_norm_from_Lgeom"] == 0.0
+        (not rows[0]["dummy_requires_grad"])
+        and rows[0]["adapter_grad_norm_from_Lgeom"] == 0.0
+        and rows[1]["dummy_requires_grad"]
+        and rows[1]["adapter_grad_norm_from_Lgeom"] > 0.0
+        and rows[0]["g_head_grad_norm_from_Lgeom"] == 0.0
         and rows[1]["g_head_grad_norm_from_Lgeom"] == 0.0
         and rows[0]["r_head_grad_norm_from_Lgeom"] == 0.0
         and rows[1]["r_head_grad_norm_from_Lgeom"] == 0.0
-        and rows[0]["adapter_grad_norm_from_Lgeom"] == 0.0
-        and rows[1]["adapter_grad_norm_from_Lgeom"] > 0.0
     )
     out = {
         "event": "smoke_oracle_g_geometry_ablation",
