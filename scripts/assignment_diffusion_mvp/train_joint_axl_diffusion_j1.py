@@ -654,20 +654,17 @@ def main() -> None:
             if step % log_every == 0 or step + 1 == steps:
                 print(json.dumps(row), flush=True)
 
-    # Save weights first so a diagnostics dump cannot lose a finished run.
-    torch.save(
-        {
-            "joint_state_dict": model.state_dict(),
-            "schedule": sch_cfg,
-            "provenance": prov,
-            "steps": steps,
-        },
-        out / "final_checkpoint.pt",
-    )
-    torch.save(
-        {"joint_state_dict": model.state_dict(), "provenance": prov},
-        out / "best_checkpoint.pt",
-    )
+    def _atomic_torch_save(obj, path: Path) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            torch.save(obj, tmp)
+            tmp.replace(path)
+        except Exception:
+            if tmp.exists():
+                tmp.unlink()
+            raise
+
+    # JSON traces first: a full GemNet ckpt is large and may fail on quota/NFS.
     try:
         (out / "event_bin_summary.json").write_text(json.dumps(aggregate_event_bins(event_records), indent=2))
         (out / "g_teacher_bin_summary.json").write_text(json.dumps(aggregate_g_teacher_bins(event_records), indent=2))
@@ -722,6 +719,26 @@ def main() -> None:
             pass
     except Exception as exc:
         print(json.dumps({"event": "j1_diag_dump_failed", "error": str(exc)}), flush=True)
+    try:
+        cpu_sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        payload = {
+            "joint_state_dict": cpu_sd,
+            "schedule": sch_cfg,
+            "provenance": prov,
+            "steps": steps,
+        }
+        _atomic_torch_save(payload, out / "final_checkpoint.pt")
+        # One copy only: best -> final (avoid a second ~200MB write).
+        best = out / "best_checkpoint.pt"
+        if best.exists() or best.is_symlink():
+            best.unlink()
+        try:
+            best.symlink_to("final_checkpoint.pt")
+        except OSError:
+            pass
+        print(json.dumps({"event": "j1_ckpt_saved", "path": str(out / "final_checkpoint.pt")}), flush=True)
+    except Exception as exc:
+        print(json.dumps({"event": "j1_ckpt_save_failed", "error": str(exc)}), flush=True)
     print(json.dumps({"event": "j1_train_done", "output": str(out), "n_event_targets": len(event_records)}), flush=True)
 
 
