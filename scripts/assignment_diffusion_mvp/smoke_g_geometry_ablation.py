@@ -95,6 +95,11 @@ def main() -> None:
         strict=True,
     )
     schedule = AsyncJumpSchedule.from_config(cfg.get("schedule") or {})
+    from mattergen.assignment.joint_assignment_diffusion.legal_moves import (
+        apply_move,
+        enumerate_g_moves,
+    )
+
     st = a_from_role_and_copy(
         role=sample["role"],
         copy=sample["copy"],
@@ -103,24 +108,32 @@ def main() -> None:
         role_z=sample["role_z"],
         K=int(sample["Z"]),
     )
-    # permute copies (G) without touching orbits (Rbar)
-    perm = torch.roll(torch.arange(st.K, device=st.A.device), 1)
-    st_perm = st.clone()
-    st_perm.A = st.A.index_select(-1, perm)
+    g_moves = enumerate_g_moves(st)
+    if not g_moves:
+        raise SystemExit("smoke failed: no legal G swap to probe copy partition")
+    # Legal G swap changes who shares a copy (C / copy_of). Copy-ID relabeling
+    # is supposed to be invariant and is the wrong probe.
+    st_swap = apply_move(st, g_moves[0])
     cg = build_cg(sample, sample["pos"], sample["cell"])
     t = torch.tensor([0.5], device=device)
 
     def _break_zero_init_adapters(model):
-        """Smoke-only: assignment residuals start at 0, so copy-perm is a no-op
-        until we probe a nonzero adapter.  Original arm still ignores them."""
+        """Smoke-only: last-layer residuals are zero-init, so un-zero weights
+        (not just bias) to let C / copy_of actually flow. Original still ignores them."""
         with torch.no_grad():
-            model.copy_to_node.bias.fill_(1.0)
+            torch.nn.init.xavier_uniform_(model.copy_to_node.weight)
             last = None
             for m in model.spatial_edge.proj.modules():
                 if isinstance(m, torch.nn.Linear):
                     last = m
-            if last is not None and last.bias is not None:
-                last.bias.fill_(0.1)
+            if last is not None:
+                torch.nn.init.xavier_uniform_(last.weight)
+            last_mp = None
+            for m in model.assign_mp.upd.modules():
+                if isinstance(m, torch.nn.Linear):
+                    last_mp = m
+            if last_mp is not None:
+                torch.nn.init.xavier_uniform_(last_mp.weight)
 
     rows = []
     for name, flag in (("original", False), ("g_conditioned", True)):
@@ -137,19 +150,20 @@ def main() -> None:
         scf, _meta = model._build_a_feedback(st, t_scalar=0.5)
         with torch.no_grad():
             o1 = model(cg, t, st, compute_jumps=False)
-            o2 = model(cg, t, st_perm, compute_jumps=False)
+            o2 = model(cg, t, st_swap, compute_jumps=False)
         dpos = float((o1.chemgraph_scores["pos"] - o2.chemgraph_scores["pos"]).abs().mean())
         rows.append(
             {
                 "arm": name,
                 "scf_enabled_flag": flag,
                 "scf_enabled_runtime": bool(scf.get("enabled", False)),
-                "pos_score_l1_under_copy_perm": dpos,
+                "g_swap": [g_moves[0].i, g_moves[0].j],
+                "pos_score_l1_under_g_swap": dpos,
             }
         )
         del model
-    orig_l1 = rows[0]["pos_score_l1_under_copy_perm"]
-    g_l1 = rows[1]["pos_score_l1_under_copy_perm"]
+    orig_l1 = rows[0]["pos_score_l1_under_g_swap"]
+    g_l1 = rows[1]["pos_score_l1_under_g_swap"]
     # FP32 GEMM noise is ~1e-7; Original must stay in that band even with
     # nonzero adapters. G-conditioned must move scores far above that noise.
     ok_orig = (not rows[0]["scf_enabled_runtime"]) and orig_l1 < 1e-5
