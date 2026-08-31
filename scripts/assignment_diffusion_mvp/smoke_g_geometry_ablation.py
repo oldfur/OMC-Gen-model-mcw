@@ -109,6 +109,19 @@ def main() -> None:
     st_perm.A = st.A.index_select(-1, perm)
     cg = build_cg(sample, sample["pos"], sample["cell"])
     t = torch.tensor([0.5], device=device)
+
+    def _break_zero_init_adapters(model):
+        """Smoke-only: assignment residuals start at 0, so copy-perm is a no-op
+        until we probe a nonzero adapter.  Original arm still ignores them."""
+        with torch.no_grad():
+            model.copy_to_node.bias.fill_(1.0)
+            last = None
+            for m in model.spatial_edge.proj.modules():
+                if isinstance(m, torch.nn.Linear):
+                    last = m
+            if last is not None and last.bias is not None:
+                last.bias.fill_(0.1)
+
     rows = []
     for name, flag in (("original", False), ("g_conditioned", True)):
         model = JointAXLModel(
@@ -118,7 +131,10 @@ def main() -> None:
             g_copy_context_mode=str(cfg.get("g_copy_context_mode") or "template_counterfactual"),
             geometry_assignment_conditioning=flag,
         ).to(device)
+        model.set_orbit_relations(partition, sample["role_edge_index"], sample["role_bond_type"])
+        _break_zero_init_adapters(model)
         model.eval()
+        scf, _meta = model._build_a_feedback(st, t_scalar=0.5)
         with torch.no_grad():
             o1 = model(cg, t, st, compute_jumps=False)
             o2 = model(cg, t, st_perm, compute_jumps=False)
@@ -126,15 +142,30 @@ def main() -> None:
         rows.append(
             {
                 "arm": name,
-                "scf_enabled": flag,
+                "scf_enabled_flag": flag,
+                "scf_enabled_runtime": bool(scf.get("enabled", False)),
                 "pos_score_l1_under_copy_perm": dpos,
-                "g_affects_geometry": dpos > 1e-8,
             }
         )
         del model
-    ok_orig = (not rows[0]["g_affects_geometry"])
-    ok_g = bool(rows[1]["g_affects_geometry"])
-    out = {"event": "smoke_g_geometry_ablation", "ok_original_invariant": ok_orig, "ok_g_affects_geometry": ok_g, "arms": rows}
+    orig_l1 = rows[0]["pos_score_l1_under_copy_perm"]
+    g_l1 = rows[1]["pos_score_l1_under_copy_perm"]
+    # FP32 GEMM noise is ~1e-7; Original must stay in that band even with
+    # nonzero adapters. G-conditioned must move scores far above that noise.
+    ok_orig = (not rows[0]["scf_enabled_runtime"]) and orig_l1 < 1e-5
+    ok_g = (
+        bool(rows[1]["scf_enabled_runtime"])
+        and g_l1 > 1e-4
+        and g_l1 > 10.0 * max(orig_l1, 1e-12)
+    )
+    out = {
+        "event": "smoke_g_geometry_ablation",
+        "ok_original_invariant": ok_orig,
+        "ok_g_affects_geometry": ok_g,
+        "orig_l1": orig_l1,
+        "g_cond_l1": g_l1,
+        "arms": rows,
+    }
     print(json.dumps(out), flush=True)
     if not (ok_orig and ok_g):
         raise SystemExit("smoke failed: G-conditioning path mismatch")
