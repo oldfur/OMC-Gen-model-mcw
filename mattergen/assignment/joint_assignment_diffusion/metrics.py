@@ -173,3 +173,153 @@ def crystal_geometry_vs_target(
         "density_ratio": (dens / tdens) if tdens > 0 and tdens != float("inf") else float("nan"),
         "inter_copy_min_dist": float(inter) if inter is not None else float("nan"),
     }
+
+
+def _pbc_pair_dist(frac: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
+    cell = cell.reshape(3, 3) if cell.numel() == 9 else cell.reshape(-1, 3, 3)[0]
+    delta = frac[:, None, :] - frac[None, :, :]
+    delta = delta - torch.round(delta)
+    return torch.linalg.norm(delta @ cell, dim=-1)
+
+
+def inter_copy_soft_clash(
+    frac: torch.Tensor,
+    cell: torch.Tensor,
+    copy_of: torch.Tensor,
+    *,
+    cutoff: float = 1.2,
+) -> float:
+    """E_clash = Σ_{C_i≠C_j} max(0, d_cut - d_ij)^2  (i<j)."""
+    dist = _pbc_pair_dist(frac, cell)
+    k = copy_of.long()
+    n = int(frac.shape[0])
+    if n < 2:
+        return 0.0
+    iu = torch.triu(torch.ones(n, n, dtype=torch.bool, device=frac.device), diagonal=1)
+    mask = iu & (k[:, None] != k[None, :])
+    if not bool(mask.any()):
+        return 0.0
+    gap = (float(cutoff) - dist[mask]).clamp(min=0.0)
+    return float((gap * gap).sum().item())
+
+
+def inter_copy_distance_stats(
+    frac: torch.Tensor,
+    cell: torch.Tensor,
+    copy_of: torch.Tensor,
+) -> dict[str, float]:
+    dist = _pbc_pair_dist(frac, cell)
+    k = copy_of.long()
+    n = int(frac.shape[0])
+    iu = torch.triu(torch.ones(n, n, dtype=torch.bool, device=frac.device), diagonal=1)
+    mask = iu & (k[:, None] != k[None, :])
+    if not bool(mask.any()):
+        return {"inter_copy_min_dist": float("nan"), "inter_copy_p5": float("nan"), "inter_copy_p10": float("nan")}
+    vals = dist[mask].detach().float().cpu()
+    return {
+        "inter_copy_min_dist": float(vals.min().item()),
+        "inter_copy_p5": float(torch.quantile(vals, 0.05).item()),
+        "inter_copy_p10": float(torch.quantile(vals, 0.10).item()),
+    }
+
+
+def _unwrap_copy_cart(frac: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
+    """Unwrap a molecule across PBC by walking min-image nearest neighbors.
+
+    Do **not** average wrapped fractional coordinates. Seed at atom 0, then
+    repeatedly attach the unused atom with the smallest minimum-image distance
+    to any already-unwrapped atom. This stays continuous when a copy straddles
+    a cell face, including chains longer than half a lattice vector.
+    """
+    cell = cell.reshape(3, 3) if cell.numel() == 9 else cell.reshape(-1, 3, 3)[0]
+    n = int(frac.shape[0])
+    if n == 0:
+        return frac @ cell
+    if n == 1:
+        return frac @ cell
+    inv = torch.linalg.inv(cell)
+    placed = torch.zeros(n, dtype=torch.bool, device=frac.device)
+    cart = torch.zeros((n, 3), dtype=cell.dtype, device=frac.device)
+    cart[0] = frac[0] @ cell
+    placed[0] = True
+    for _ in range(n - 1):
+        src = cart[placed]
+        unused_idx = (~placed).nonzero(as_tuple=False).flatten()
+        unused_frac = frac[unused_idx]
+        placed_frac = src @ inv
+        dfrac = unused_frac[:, None, :] - placed_frac[None, :, :]
+        dfrac = dfrac - torch.round(dfrac)
+        dist = torch.linalg.norm(dfrac @ cell, dim=-1)
+        best_p = dist.argmin(dim=1)
+        best_d = dist.gather(1, best_p.unsqueeze(1)).squeeze(1)
+        pick = int(best_d.argmin().item())
+        u = int(unused_idx[pick].item())
+        p = int(best_p[pick].item())
+        cart[u] = src[p] + dfrac[pick, p] @ cell
+        placed[u] = True
+    return cart
+
+
+def copy_organization_stats(
+    frac: torch.Tensor,
+    cell: torch.Tensor,
+    copy_of: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> dict[str, float]:
+    """COM / radius / overlap after PBC unwrap; COM–COM uses minimum image."""
+    cell = cell.reshape(3, 3) if cell.numel() == 9 else cell.reshape(-1, 3, 3)[0]
+    inv = torch.linalg.inv(cell)
+    k = copy_of.long()
+    uniq = torch.unique(k)
+    nan = {
+        "copy_com_min": float("nan"),
+        "copy_radius_mean": float("nan"),
+        "copy_radius_max": float("nan"),
+        "copy_overlap_max": float("nan"),
+        "copy_overlap_mean": float("nan"),
+    }
+    if int(uniq.numel()) < 2:
+        return nan
+    com_frac = []
+    radii = []
+    for ck in uniq.tolist():
+        idx = (k == int(ck)).nonzero(as_tuple=False).flatten()
+        cart = _unwrap_copy_cart(frac[idx], cell)
+        com_cart = cart.mean(0)
+        rad = float(torch.linalg.norm(cart - com_cart, dim=-1).max().item())
+        com_frac.append(com_cart @ inv)
+        radii.append(rad)
+    cf = torch.stack(com_frac, 0)
+    dfrac = cf[:, None, :] - cf[None, :, :]
+    dfrac = dfrac - torch.round(dfrac)
+    dcom = torch.linalg.norm(dfrac @ cell, dim=-1)
+    m = int(uniq.numel())
+    iu = torch.triu(torch.ones(m, m, dtype=torch.bool, device=frac.device), diagonal=1)
+    seps = dcom[iu]
+    overlaps = []
+    for a in range(m):
+        for b in range(a + 1, m):
+            overlaps.append((radii[a] + radii[b]) / (float(dcom[a, b].item()) + eps))
+    return {
+        "copy_com_min": float(seps.min().item()) if seps.numel() else float("nan"),
+        "copy_radius_mean": float(sum(radii) / len(radii)) if radii else float("nan"),
+        "copy_radius_max": float(max(radii)) if radii else float("nan"),
+        "copy_overlap_max": float(max(overlaps)) if overlaps else float("nan"),
+        "copy_overlap_mean": float(sum(overlaps) / len(overlaps)) if overlaps else float("nan"),
+    }
+
+
+def snapshot_inter_copy_metrics(
+    frac: torch.Tensor,
+    cell: torch.Tensor,
+    copy_of: torch.Tensor,
+    *,
+    clash_cutoff: float = 1.2,
+) -> dict[str, float]:
+    out = {
+        "E_clash": inter_copy_soft_clash(frac, cell, copy_of, cutoff=clash_cutoff),
+    }
+    out.update(inter_copy_distance_stats(frac, cell, copy_of))
+    out.update(copy_organization_stats(frac, cell, copy_of))
+    return out

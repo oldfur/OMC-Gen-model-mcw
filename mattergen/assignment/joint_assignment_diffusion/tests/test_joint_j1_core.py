@@ -1,6 +1,7 @@
 """J1 core unit tests (authored; not executed in this commit)."""
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from mattergen.assignment.global_copy_assembly.orbit_membership import build_orbit_partition
@@ -801,6 +802,150 @@ def test_crystal_geometry_clash_metric():
     close = torch.tensor([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
     bad = crystal_geometry_vs_target(close, cell, frac, cell)
     assert not bad["no_clash"]
+
+
+def test_pbc_intercopy_invariance_lattice_shift_and_wrap():
+    """Molecule +1 lattice vector, or wrapping one copy across a face, must not change metrics."""
+    from mattergen.assignment.joint_assignment_diffusion.metrics import snapshot_inter_copy_metrics
+
+    cell = torch.eye(3) * 10.0
+    # Two 3-atom copies, well separated
+    frac = torch.tensor(
+        [
+            [0.10, 0.10, 0.10],
+            [0.12, 0.10, 0.10],
+            [0.10, 0.12, 0.10],
+            [0.60, 0.60, 0.60],
+            [0.62, 0.60, 0.60],
+            [0.60, 0.62, 0.60],
+        ],
+        dtype=torch.float32,
+    )
+    copy = torch.tensor([0, 0, 0, 1, 1, 1])
+    keys_all = (
+        "E_clash",
+        "inter_copy_min_dist",
+        "inter_copy_p5",
+        "inter_copy_p10",
+        "copy_com_min",
+        "copy_radius_mean",
+        "copy_overlap_max",
+    )
+    base = snapshot_inter_copy_metrics(frac, cell, copy, clash_cutoff=1.2)
+
+    # Test A: translate one complete molecule (copy 0) by a lattice vector
+    shifted = frac.clone()
+    shifted[:3] = (shifted[:3] + torch.tensor([1.0, 0.0, 0.0])).remainder(1.0)
+    a = snapshot_inter_copy_metrics(shifted, cell, copy, clash_cutoff=1.2)
+    for k in keys_all:
+        assert abs(float(base[k]) - float(a[k])) < 1e-4, (k, base[k], a[k])
+
+    # Test B: same molecule stored across the cell face vs explicit unwrap (frac x=1.00)
+    straddle = frac.clone()
+    straddle[0, 0] = 0.98
+    straddle[1, 0] = 0.00
+    straddle[2, 0] = 0.98
+    explicit = frac.clone()
+    explicit[0, 0] = 0.98
+    explicit[1, 0] = 1.00
+    explicit[2, 0] = 0.98
+    b = snapshot_inter_copy_metrics(straddle, cell, copy, clash_cutoff=1.2)
+    c = snapshot_inter_copy_metrics(explicit, cell, copy, clash_cutoff=1.2)
+    for k in keys_all:
+        assert abs(float(b[k]) - float(c[k])) < 1e-4, (k, b[k], c[k])
+    # Continuity: atom just inside vs just across the face (Δx=0.002 lattice)
+    just_in = straddle.clone()
+    just_in[1, 0] = 0.999
+    just_out = straddle.clone()
+    just_out[1, 0] = 0.001  # = 1.001 wrapped
+    cin = snapshot_inter_copy_metrics(just_in, cell, copy, clash_cutoff=1.2)
+    cout = snapshot_inter_copy_metrics(just_out, cell, copy, clash_cutoff=1.2)
+    for k in ("copy_com_min", "copy_radius_mean", "copy_overlap_max", "inter_copy_min_dist"):
+        assert abs(float(cin[k]) - float(cout[k])) < 0.05, (k, cin[k], cout[k])
+
+    # Test C: different wrapping of the same crystal (per-atom integer images)
+    rng = torch.Generator().manual_seed(0)
+    jumps = torch.randint(-2, 3, frac.shape, generator=rng).float()
+    wrapped_atoms = (frac + jumps).remainder(1.0)
+    d = snapshot_inter_copy_metrics(wrapped_atoms, cell, copy, clash_cutoff=1.2)
+    for k in ("E_clash", "inter_copy_min_dist", "inter_copy_p5", "inter_copy_p10"):
+        assert abs(float(base[k]) - float(d[k])) < 1e-4, (k, base[k], d[k])
+    # Molecule-preserving wrap: shift each copy by its own lattice image
+    mol_wrap = frac.clone()
+    mol_wrap[:3] = (mol_wrap[:3] + torch.tensor([0.0, 1.0, -1.0])).remainder(1.0)
+    mol_wrap[3:] = (mol_wrap[3:] + torch.tensor([-2.0, 0.0, 1.0])).remainder(1.0)
+    e = snapshot_inter_copy_metrics(mol_wrap, cell, copy, clash_cutoff=1.2)
+    for k in keys_all:
+        assert abs(float(base[k]) - float(e[k])) < 1e-4, (k, base[k], e[k])
+
+
+def test_equivalent_copies_reject_role_z_mismatch():
+    from mattergen.assignment.joint_assignment_diffusion.scaled_dataset import pack_crystal
+
+    pos = np.zeros((4, 3), dtype=np.float32)
+    cell = np.eye(3, dtype=np.float32) * 8.0
+    z = np.array([6, 1, 7, 1], dtype=np.int64)  # C-H vs N-H but same mol_atom_idx
+    mapping = {
+        "mapping": {"mol_id": [0, 0, 1, 1], "mol_atom_idx": [0, 1, 0, 1], "num_molecules": 2},
+        "crystal_bonds": [{"begin": 0, "end": 1, "type": 1}, {"begin": 2, "end": 3, "type": 1}],
+    }
+    try:
+        pack_crystal(material_id="bad", pos=pos, cell=cell, atomic_numbers=z, mapping_record=mapping)
+        raise AssertionError("expected role_z_mismatch")
+    except ValueError as e:
+        assert "role_z_mismatch" in str(e)
+
+
+def test_equivalent_copies_reject_unequal_sizes_and_graph_mismatch():
+    from mattergen.assignment.joint_assignment_diffusion.scaled_dataset import pack_crystal
+
+    cell = np.eye(3, dtype=np.float32) * 8.0
+    # Two species sharing mol_atom_idx 0,1 on the first two atoms of each copy — unequal sizes
+    pos = np.zeros((5, 3), dtype=np.float32)
+    z = np.array([6, 1, 6, 1, 8], dtype=np.int64)
+    mapping = {
+        "mapping": {"mol_id": [0, 0, 1, 1, 1], "mol_atom_idx": [0, 1, 0, 1, 2], "num_molecules": 2},
+        "crystal_bonds": [{"begin": 0, "end": 1, "type": 1}, {"begin": 2, "end": 3, "type": 1}, {"begin": 3, "end": 4, "type": 1}],
+    }
+    try:
+        pack_crystal(material_id="uneq", pos=pos, cell=cell, atomic_numbers=z, mapping_record=mapping)
+        raise AssertionError("expected unequal_copy_sizes")
+    except ValueError as e:
+        assert "unequal_copy_sizes" in str(e)
+
+    # Same sizes / Z but different intramolecular graphs
+    pos = np.zeros((6, 3), dtype=np.float32)
+    z = np.array([6, 6, 1, 6, 6, 1], dtype=np.int64)
+    mapping = {
+        "mapping": {
+            "mol_id": [0, 0, 0, 1, 1, 1],
+            "mol_atom_idx": [0, 1, 2, 0, 1, 2],
+            "num_molecules": 2,
+        },
+        "crystal_bonds": [
+            {"begin": 0, "end": 1, "type": 1},
+            {"begin": 1, "end": 2, "type": 1},
+            {"begin": 3, "end": 4, "type": 1},
+            # copy 1 missing 4-5, extra 3-5
+            {"begin": 3, "end": 5, "type": 1},
+        ],
+    }
+    try:
+        pack_crystal(material_id="gmis", pos=pos, cell=cell, atomic_numbers=z, mapping_record=mapping)
+        raise AssertionError("expected copy_graph_mismatch")
+    except ValueError as e:
+        assert "copy_graph_mismatch" in str(e)
+
+
+def test_scf_hard_weight_gate():
+    from mattergen.assignment.joint_assignment_diffusion.joint_model import scf_hard_weight
+
+    assert scf_hard_weight(0.3, enabled=False, gate="hard") == 0.0
+    assert scf_hard_weight(0.9, enabled=False, gate="hard") == 0.0
+    assert scf_hard_weight(0.49, enabled=True, gate="hard", threshold=0.5) == 0.0
+    assert scf_hard_weight(0.5, enabled=True, gate="hard", threshold=0.5) == 1.0
+    assert scf_hard_weight(0.9, enabled=True, gate="hard", threshold=0.5) == 1.0
+    assert scf_hard_weight(0.1, enabled=True, gate=None) == 1.0
 
 
 def test_geometry_assignment_conditioning_flag_on_model_signature():

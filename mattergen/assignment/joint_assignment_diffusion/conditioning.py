@@ -45,7 +45,10 @@ class OrbitRelationTable(nn.Module):
         role_edge_index: torch.Tensor,
         role_bond_type: torch.Tensor,
     ) -> None:
-        j = self.num_orbits
+        j_part = int(partition.J)
+        if j_part > self.num_orbits:
+            raise ValueError(f"partition.J={j_part} exceeds OrbitRelationTable.num_orbits={self.num_orbits}")
+        j = j_part
         device = role_edge_index.device
         bond = torch.zeros(j, j, dtype=torch.long, device=device)
         # adjacency on orbits
@@ -91,11 +94,17 @@ class OrbitRelationTable(nn.Module):
         reachable = dist < disconnected
         dist_bin = torch.where(reachable, dist.clamp(max=4), dist_bin)
         dist_bin.fill_diagonal_(0)
-        self.bond_type = bond
-        self.graph_dist = dist
-        self.bond_exists = (edge_mult > 0).to(dtype=torch.float32)
-        self.edge_mult = edge_mult
-        self.dist_bin = dist_bin
+        # Pad into fixed-size buffers so one module serves variable-J crystals.
+        self.bond_type.zero_()
+        self.graph_dist.fill_(self.dist_emb.num_embeddings - 1)
+        self.bond_exists.zero_()
+        self.edge_mult.zero_()
+        self.dist_bin.fill_(self.DIST_BIN_DISCONNECTED)
+        self.bond_type[:j, :j] = bond
+        self.graph_dist[:j, :j] = dist
+        self.bond_exists[:j, :j] = (edge_mult > 0).to(dtype=torch.float32)
+        self.edge_mult[:j, :j] = edge_mult
+        self.dist_bin[:j, :j] = dist_bin
 
     def raw_template(self, o_i: torch.Tensor, o_j: torch.Tensor) -> dict[str, torch.Tensor]:
         """Discrete orbit-pair template (no learned params, no copy id)."""

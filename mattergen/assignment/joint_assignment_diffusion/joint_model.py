@@ -32,6 +32,21 @@ from .schedule import AsyncJumpSchedule
 from .state import JointAssignmentState
 
 
+def scf_hard_weight(
+    t_scalar: float,
+    *,
+    enabled: bool,
+    gate: str | None,
+    threshold: float = 0.5,
+) -> float:
+    """Hard assignment→geometry gate. t=1 high noise, t=0 clean."""
+    if not enabled:
+        return 0.0
+    if gate not in ("hard", "hard_050", "hard_threshold"):
+        return 1.0
+    return 0.0 if float(t_scalar) < float(threshold) else 1.0
+
+
 @dataclass
 class JointModelOutput:
     chemgraph_scores: ChemGraph
@@ -55,6 +70,8 @@ class JointAXLModel(nn.Module):
         g_copy_context_mode: str = "mean",
         g_relation_detach_trunk: bool = True,
         geometry_assignment_conditioning: bool = True,
+        scf_time_gate: str | None = None,
+        scf_gate_threshold: float = 0.5,
     ):
         super().__init__()
         self.denoiser = denoiser
@@ -63,6 +80,8 @@ class JointAXLModel(nn.Module):
         self.g_copy_context_mode = str(g_copy_context_mode or "mean")
         self.g_relation_detach_trunk = bool(g_relation_detach_trunk)
         self.geometry_assignment_conditioning = bool(geometry_assignment_conditioning)
+        self.scf_time_gate = None if scf_time_gate in (None, "", "none", "off") else str(scf_time_gate)
+        self.scf_gate_threshold = float(scf_gate_threshold)
         self.orbit_encoder = OrbitSiteEncoder(hidden=self.hidden)
         self.orbit_to_node = nn.Sequential(
             nn.Linear(self.hidden, self.hidden),
@@ -133,6 +152,15 @@ class JointAXLModel(nn.Module):
         ):
             yield from m.parameters()
 
+    def scf_assignment_weight(self, t_scalar: float) -> float:
+        """Hard SCF gate: 0 below threshold, 1 at/above. Off if SCF itself is disabled."""
+        return scf_hard_weight(
+            t_scalar,
+            enabled=bool(self.geometry_assignment_conditioning),
+            gate=self.scf_time_gate,
+            threshold=self.scf_gate_threshold,
+        )
+
     def set_orbit_relations(self, partition, role_edge_index, role_bond_type):
         self.rho.set_from_role_graph(
             partition=partition, role_edge_index=role_edge_index, role_bond_type=role_bond_type
@@ -149,6 +177,9 @@ class JointAXLModel(nn.Module):
         ``state`` is caller-supplied. Trajectory-oracle passes
         ``A_t = forward_CTMC(GT A_0).state_at(t)``. Clean-G passes
         ``A_0^GT`` at every t. This path never reads GJumpHead / RJumpHead outputs.
+
+        ``scf_time_gate='hard'`` applies a config threshold (default 0.5):
+        w(t)=0 for t < threshold (GemNet identical to original), w=1 otherwise.
         """
         z_orbit = self.orbit_encoder(state.element_by_orbit.to(state.A.device))
         orbit_of = state.orbit_of()
@@ -188,14 +219,36 @@ class JointAXLModel(nn.Module):
             _v, c_i, _va = self.copy_pool(h, orbit_of, copy_of, z_orbit, state.K)
             return delta + self.copy_to_node(c_i)
 
+        w = self.scf_assignment_weight(t_scalar)
+        if w == 0.0:
+            # Strict original GemNet path: do not even register adapters.
+            def edge_adapter(m, edge_index, cell_offsets):
+                return torch.zeros_like(m)
+
+            def mid_block_node_fn(h, block_idx):
+                return torch.zeros_like(h)
+
+            node_delta = torch.zeros_like(node_delta)
+        else:
+            node_delta = node_delta * w
+
+            _edge = edge_adapter
+            _mid = mid_block_node_fn
+
+            def edge_adapter(m, edge_index, cell_offsets):
+                return _edge(m, edge_index, cell_offsets) * w
+
+            def mid_block_node_fn(h, block_idx):
+                return _mid(h, block_idx) * w
+
+        scf_on = bool(self.geometry_assignment_conditioning) and w != 0.0
         scf = {
-            "enabled": bool(self.geometry_assignment_conditioning),
+            "enabled": scf_on,
             "node_delta": node_delta,
             "edge_adapter": edge_adapter,
             "mid_block_node_fn": mid_block_node_fn,
         }
-        if not self.geometry_assignment_conditioning:
-            # Original geometry path: GemNet sees no assignment-derived residuals.
+        if not scf_on:
             scf = {"enabled": False}
         meta = {
             "beta_r": beta_r,
@@ -207,6 +260,10 @@ class JointAXLModel(nn.Module):
             "C": C,
             "clock": clock,
             "geometry_assignment_conditioning": bool(self.geometry_assignment_conditioning),
+            "scf_time_gate": self.scf_time_gate,
+            "scf_gate_threshold": self.scf_gate_threshold,
+            "scf_weight": float(w),
+            "scf_enabled_runtime": bool(scf_on),
         }
         return scf, meta
 

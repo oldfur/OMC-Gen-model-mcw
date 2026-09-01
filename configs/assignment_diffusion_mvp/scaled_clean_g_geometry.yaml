@@ -1,0 +1,44 @@
+scaled_clean_g:
+  output_dir: outputs/assignment_diffusion_mvp/scaled_clean_g_geometry
+  dataset_dir: outputs/assignment_diffusion_mvp/scaled_clean_g_dataset
+  seed: 17
+  device: auto
+  steps: 8000
+  log_every_steps: 50
+  val_dump_steps: [2000, 4000, 6000, 8000]
+  val_t_samples: 4
+  limit_density: 0.05
+
+  gemnet:
+    model_path: /public/home/lmy/mattergen_omc25/outputs/singlerun/2026-06-03/le50_molcsp_scratch_mean_cell025_bondhuber_lowt04_posonly_w1e-3_8gpu01234567
+    load_epoch: 294
+    checkpoint_path: /public/home/lmy/mattergen_omc25/outputs/singlerun/2026-06-03/le50_molcsp_scratch_mean_cell025_bondhuber_lowt04_posonly_w1e-3_8gpu01234567/lightning_logs/version_0/checkpoints/epoch=294-loss_val=0.04.ckpt
+
+  scf_time_gate: hard
+  scf_gate_threshold: 0.5
+  max_orbits: 64
+  train_assignment_heads: false
+
+  cache_root: /public/home/lmy/mattergen_omc25/datasets/cache/omc25_le50_mattergen
+  molmap_train: /public/home/lmy/mattergen_omc25/datasets/molecule_mapping/omc25_le300_train_molmap_hybrid_v3.jsonl.gz
+  molmap_val: /public/home/lmy/mattergen_omc25/datasets/molecule_mapping/omc25_le300_val_molmap_hybrid_v3.jsonl.gz
+  train_n: 3000
+  val_n: 250
+  test_n: 150
+  max_atoms: 50
+  min_copies: 2
+
+  optim:
+    lr_pretrained: 1.0e-5
+    lr_new: 1.0e-4
+    weight_decay: 1.0e-4
+    gradient_clip_norm: 1.0
+
+  sampling:
+    n_crystals: 50
+    n_traj_per_crystal: 2
+    n_reverse_steps: 100
+    snapshot_every: 10
+    clash_cutoff: 1.2
+    min_dist_cutoff: 0.7
+    overlap_ok: 1.5
