@@ -24,6 +24,10 @@ from mattergen.assignment.joint_assignment_diffusion.sampler import a_first_lie_
 from mattergen.assignment.joint_assignment_diffusion.scaled_dataset import clean_state_from_sample, crystal_to_tensors
 from mattergen.assignment.joint_assignment_diffusion.schedule import AsyncJumpSchedule
 from mattergen.assignment.noisy_copy_assignment.gemnet_loader import build_mol_conditioning_from_sample, load_molecular_csp_gemnet
+from mattergen.assignment.noisy_copy_assignment.mattergen_noise_adapter import MatterGenNativeNoiseAdapter
+from mattergen.common.diffusion.predictors_correctors import LatticeAncestralSamplingPredictor
+from mattergen.common.utils.data_utils import compute_lattice_polar_decomposition
+from mattergen.diffusion.wrapped.wrapped_predictors_correctors import WrappedAncestralSamplingPredictor
 import importlib.util
 
 _spec = importlib.util.spec_from_file_location(
@@ -33,6 +37,66 @@ _j1 = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
 _spec.loader.exec_module(_j1)
 build_cg = _j1.build_cg
+
+
+def _as_cell_batch(cell: torch.Tensor) -> torch.Tensor:
+    return cell.reshape(-1, 3, 3) if cell.numel() == 9 else cell.reshape(-1, 3, 3)
+
+
+def _make_score_to_prev(noise: MatterGenNativeNoiseAdapter):
+    """MatterGen ancestral predictor for pos (wrapped VE) + cell (lattice VP).
+
+    The previous Euler ``x - dt * score`` is not the SDE reverse: predicted
+    lattice noise can explode the cell, leaving GemNet with edges but no
+    triplets (empty id_ragged_idx).
+    """
+    pos_pred = WrappedAncestralSamplingPredictor(corruption=noise.corruption.sdes["pos"], score_fn=None)
+    cell_pred = LatticeAncestralSamplingPredictor(corruption=noise.corruption.sdes["cell"], score_fn=None)
+
+    def score_to_prev(frac_t, cell_t, scores, t, s):
+        device = frac_t.device
+        t_ten = torch.as_tensor(t, device=device, dtype=torch.float32).reshape(-1)
+        dt = torch.as_tensor(float(s) - float(t), device=device, dtype=torch.float32)
+        cell_b = _as_cell_batch(cell_t).to(device)
+        n = int(frac_t.shape[0])
+        pos_idx = torch.zeros(n, dtype=torch.long, device=device)
+        # Dummy batch for LatticeVPSDE limit_mean (needs num_atoms).
+        from mattergen.assignment.noisy_copy_assignment.mattergen_noise_adapter import _BatchView
+
+        batch = _BatchView(
+            {
+                "pos": frac_t,
+                "cell": cell_b,
+                "num_atoms": torch.tensor([n], device=device, dtype=torch.long),
+            }
+        )
+        frac_s, _ = pos_pred.update_given_score(
+            x=frac_t,
+            t=t_ten,
+            dt=dt,
+            batch_idx=pos_idx,
+            score=scores["pos"],
+            batch=batch,
+        )
+        cell_score = scores["cell"]
+        if cell_score.ndim == 2:
+            cell_score = cell_score.unsqueeze(0)
+        cell_s, _ = cell_pred.update_given_score(
+            x=cell_b,
+            t=t_ten,
+            dt=dt,
+            batch_idx=None,
+            score=cell_score,
+            batch=batch,
+        )
+        cell_s = compute_lattice_polar_decomposition(cell_s)
+        vol = torch.abs(torch.linalg.det(cell_s.reshape(3, 3)))
+        # Keep the previous cell if the update collapsed / exploded the lattice.
+        if not torch.isfinite(vol) or float(vol.item()) < 1e-2 or float(vol.item()) > 1e6:
+            cell_s = cell_b
+        return frac_s.remainder(1.0), cell_s.reshape(3, 3)
+
+    return score_to_prev
 
 
 def main() -> None:
@@ -86,6 +150,8 @@ def main() -> None:
     model.eval()
 
     times = [1.0 - i / float(n_steps) for i in range(n_steps + 1)]
+    noise = MatterGenNativeNoiseAdapter(limit_density=float(cfg.get("limit_density", 0.05)))
+    score_to_prev = _make_score_to_prev(noise)
     rows = []
     with torch.no_grad():
         for ci in range(n_crystals):
@@ -107,8 +173,18 @@ def main() -> None:
                 g = torch.Generator(device="cpu")
                 g.manual_seed(10_000 + ci * 100 + ti)
                 n = int(sample["N"])
-                frac = torch.rand(n, 3, generator=g).to(device)
-                cell = torch.eye(3, device=device) * (float(n) / 0.05) ** (1.0 / 3.0)
+                # t=1 native prior (same SDEs as training), not a deterministic cube.
+                prior = noise.corrupt_fixed_sample(
+                    frac_coords_0=sample["pos"],
+                    lattice_0=sample["cell"],
+                    num_atoms=n,
+                    t=torch.tensor([1.0], dtype=torch.float32),
+                    generator=g,
+                )
+                frac = prior.frac_coords_t.to(device)
+                cell = prior.lattice_t.to(device)
+                if cell.ndim == 3:
+                    cell = cell.reshape(3, 3)
                 state = st0.clone()
                 snaps = []
                 rec_clash = None
@@ -126,6 +202,7 @@ def main() -> None:
                         s=s,
                         generator=g,
                         static_A=True,
+                        score_to_prev=score_to_prev,
                     )
                     if k % snap_every == 0 or k + 1 == len(times) - 1:
                         met = snapshot_inter_copy_metrics(frac, cell, st0.copy_of(), clash_cutoff=clash_cut)

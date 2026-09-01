@@ -804,6 +804,21 @@ def test_crystal_geometry_clash_metric():
     assert not bad["no_clash"]
 
 
+def test_gemnet_empty_triplet_index_kmax():
+    """Sampling can produce edges without triplets; torch.max on empty must not crash."""
+    from mattergen.common.gemnet.layers.efficient import EfficientInteractionBilinear, _ragged_kmax
+
+    empty = torch.zeros((0,), dtype=torch.long)
+    assert _ragged_kmax(empty) == 0
+    assert _ragged_kmax(torch.tensor([0, 2, 1])) == 3
+    layer = EfficientInteractionBilinear(emb_size=4, emb_size_interm=3, units_out=5)
+    n_edges = 6
+    rbf_W1 = torch.zeros(n_edges, 3, 2)
+    sph = torch.zeros(n_edges, 2, 0)
+    out = layer((rbf_W1, sph), torch.zeros(0, 4), torch.zeros((0,), dtype=torch.long), empty)
+    assert out.shape == (n_edges, 5)
+
+
 def test_pbc_intercopy_invariance_lattice_shift_and_wrap():
     """Molecule +1 lattice vector, or wrapping one copy across a face, must not change metrics."""
     from mattergen.assignment.joint_assignment_diffusion.metrics import snapshot_inter_copy_metrics

@@ -12,6 +12,13 @@ import torch
 from mattergen.common.gemnet.initializers import he_orthogonal_init
 
 
+def _ragged_kmax(id_ragged_idx: torch.Tensor) -> int:
+    """Max neighbor copies along a padded ragged index; 0 if there are no triplets."""
+    if id_ragged_idx is None or id_ragged_idx.numel() == 0:
+        return 0
+    return int(id_ragged_idx.max().item()) + 1
+
+
 class EfficientInteractionDownProjection(torch.nn.Module):
     """
     Down projection in the efficient reformulation.
@@ -69,15 +76,9 @@ class EfficientInteractionDownProjection(torch.nn.Module):
         rbf_W1 = rbf_W1.permute(1, 2, 0)
         # (nEdges, emb_size_interm, num_spherical)
 
-        # Zero padded dense matrix
-        # maximum number of neighbors, catch empty id_ca with maximum
-        if sph.shape[0] == 0:
-            Kmax = 0
-        else:
-            Kmax = torch.max(
-                torch.max(id_ragged_idx + 1),
-                torch.tensor(0).to(id_ragged_idx.device),
-            )
+        # Zero padded dense matrix. Empty triplets (isolated edges / exploded cell)
+        # must not call torch.max on a 0-element index.
+        Kmax = 0 if sph.shape[0] == 0 else _ragged_kmax(id_ragged_idx)
 
         sph2 = sph.new_zeros(num_edges, Kmax, self.num_spherical)
         sph2[id_ca, id_ragged_idx] = sph
@@ -151,14 +152,15 @@ class EfficientInteractionBilinear(torch.nn.Module):
         if nEdges == 0:
             # shape=[0,0]
             warn(f"Zero graph edges found in {self.__class__}")
-            return torch.zeros((0, 0))
+            return torch.zeros((0, 0), device=rbf_W1.device, dtype=rbf_W1.dtype)
+
+        # Edges can exist without triplets (degree ≤ 1, or a collapsed/exploded cell).
+        # torch.max() on a 0-element tensor raises; treat as Kmax=0 and skip the bilinear.
+        Kmax = _ragged_kmax(id_ragged_idx)
+        if Kmax == 0 or m.numel() == 0:
+            return rbf_W1.new_zeros(nEdges, self.units_out)
 
         # Create (zero-padded) dense matrix of the neighboring edge embeddings.
-        Kmax = torch.max(
-            torch.max(id_ragged_idx) + 1,
-            torch.tensor(0).to(id_ragged_idx.device),
-        )
-        # maximum number of neighbors, catch empty id_reduce_ji with maximum
         m2 = m.new_zeros(nEdges, Kmax, self.emb_size)
         m2[id_reduce, id_ragged_idx] = m
         # (num_quadruplets or num_triplets, emb_size) -> (nEdges, Kmax, emb_size)
