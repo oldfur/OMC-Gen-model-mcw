@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -43,12 +44,11 @@ def _as_cell_batch(cell: torch.Tensor) -> torch.Tensor:
     return cell.reshape(-1, 3, 3) if cell.numel() == 9 else cell.reshape(-1, 3, 3)
 
 
-def _make_score_to_prev(noise: MatterGenNativeNoiseAdapter):
+def _make_score_to_prev(noise: MatterGenNativeNoiseAdapter, rng_slot: dict):
     """MatterGen ancestral predictor for pos (wrapped VE) + cell (lattice VP).
 
-    The previous Euler ``x - dt * score`` is not the SDE reverse: predicted
-    lattice noise can explode the cell, leaving GemNet with edges but no
-    triplets (empty id_ragged_idx).
+    Ancestral ``randn`` is seeded from ``rng_slot['g']`` so Original / Clean-G
+    share the same Wiener increments given the same trajectory generator.
     """
     pos_pred = WrappedAncestralSamplingPredictor(corruption=noise.corruption.sdes["pos"], score_fn=None)
     cell_pred = LatticeAncestralSamplingPredictor(corruption=noise.corruption.sdes["cell"], score_fn=None)
@@ -60,7 +60,6 @@ def _make_score_to_prev(noise: MatterGenNativeNoiseAdapter):
         cell_b = _as_cell_batch(cell_t).to(device)
         n = int(frac_t.shape[0])
         pos_idx = torch.zeros(n, dtype=torch.long, device=device)
-        # Dummy batch for LatticeVPSDE limit_mean (needs num_atoms).
         from mattergen.assignment.noisy_copy_assignment.mattergen_noise_adapter import _BatchView
 
         batch = _BatchView(
@@ -70,28 +69,43 @@ def _make_score_to_prev(noise: MatterGenNativeNoiseAdapter):
                 "num_atoms": torch.tensor([n], device=device, dtype=torch.long),
             }
         )
-        frac_s, _ = pos_pred.update_given_score(
-            x=frac_t,
-            t=t_ten,
-            dt=dt,
-            batch_idx=pos_idx,
-            score=scores["pos"],
-            batch=batch,
-        )
-        cell_score = scores["cell"]
-        if cell_score.ndim == 2:
-            cell_score = cell_score.unsqueeze(0)
-        cell_s, _ = cell_pred.update_given_score(
-            x=cell_b,
-            t=t_ten,
-            dt=dt,
-            batch_idx=None,
-            score=cell_score,
-            batch=batch,
-        )
+        g = rng_slot.get("g")
+        restore = None
+        if g is not None:
+            seed = int(torch.randint(0, 2**31 - 1, (1,), generator=g).item())
+            cpu_state = torch.random.get_rng_state()
+            cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            restore = (cpu_state, cuda_state)
+        try:
+            frac_s, _ = pos_pred.update_given_score(
+                x=frac_t,
+                t=t_ten,
+                dt=dt,
+                batch_idx=pos_idx,
+                score=scores["pos"],
+                batch=batch,
+            )
+            cell_score = scores["cell"]
+            if cell_score.ndim == 2:
+                cell_score = cell_score.unsqueeze(0)
+            cell_s, _ = cell_pred.update_given_score(
+                x=cell_b,
+                t=t_ten,
+                dt=dt,
+                batch_idx=None,
+                score=cell_score,
+                batch=batch,
+            )
+        finally:
+            if restore is not None:
+                torch.random.set_rng_state(restore[0])
+                if restore[1] is not None:
+                    torch.cuda.set_rng_state_all(restore[1])
         cell_s = compute_lattice_polar_decomposition(cell_s)
         vol = torch.abs(torch.linalg.det(cell_s.reshape(3, 3)))
-        # Keep the previous cell if the update collapsed / exploded the lattice.
         if not torch.isfinite(vol) or float(vol.item()) < 1e-2 or float(vol.item()) > 1e6:
             cell_s = cell_b
         return frac_s.remainder(1.0), cell_s.reshape(3, 3)
@@ -109,6 +123,8 @@ def main() -> None:
     p.add_argument("--mattergen-model-path", type=str, default=None)
     p.add_argument("--mattergen-load-epoch", type=int, default=None)
     p.add_argument("--mattergen-checkpoint", type=str, default=None)
+    p.add_argument("--n-crystals", type=int, default=None, help="Override sampling.n_crystals (use all test if larger than split).")
+    p.add_argument("--n-traj-per-crystal", type=int, default=None)
     args = p.parse_args()
     if not args.execute:
         raise SystemExit("Refusing without --execute")
@@ -119,8 +135,8 @@ def main() -> None:
     out = args.output_dir
     out.mkdir(parents=True, exist_ok=True)
     test = torch.load(Path(cfg["dataset_dir"]) / "test.pt", map_location="cpu", weights_only=False)
-    n_crystals = min(int(scfg.get("n_crystals", 50)), len(test))
-    n_traj = int(scfg.get("n_traj_per_crystal", 2))
+    n_crystals = min(int(args.n_crystals if args.n_crystals is not None else scfg.get("n_crystals", 50)), len(test))
+    n_traj = int(args.n_traj_per_crystal if args.n_traj_per_crystal is not None else scfg.get("n_traj_per_crystal", 2))
     n_steps = int(scfg.get("n_reverse_steps", 100))
     snap_every = int(scfg.get("snapshot_every", 10))
     clash_cut = float(scfg.get("clash_cutoff", 1.2))
@@ -151,7 +167,25 @@ def main() -> None:
 
     times = [1.0 - i / float(n_steps) for i in range(n_steps + 1)]
     noise = MatterGenNativeNoiseAdapter(limit_density=float(cfg.get("limit_density", 0.05)))
-    score_to_prev = _make_score_to_prev(noise)
+    rng_slot: dict = {"g": None}
+    score_to_prev = _make_score_to_prev(noise, rng_slot)
+    ckpt_sha = hashlib.sha256(Path(args.checkpoint).read_bytes()).hexdigest()
+    prov = {
+        "ablation_arm": args.ablation_arm,
+        "checkpoint": str(args.checkpoint),
+        "checkpoint_sha256": ckpt_sha,
+        "n_crystals": n_crystals,
+        "n_traj_per_crystal": n_traj,
+        "n_reverse_steps": n_steps,
+        "test_n": len(test),
+        "seed_fn": "10000 + crystal_index * 100 + traj_index",
+        "paired_reverse_noise": True,
+        "scf_time_gate": gate,
+        "scf_gate_threshold": float(cfg.get("scf_gate_threshold", 0.5)),
+        "static_A": True,
+    }
+    (out / "sample_provenance.json").write_text(json.dumps(prov, indent=2))
+    print(json.dumps({"event": "sample_start", **prov}), flush=True)
     rows = []
     with torch.no_grad():
         for ci in range(n_crystals):
@@ -170,8 +204,15 @@ def main() -> None:
             )
             samp = dict(sample)
             for ti in range(n_traj):
+                traj_path = out / f"traj_{ci}_{ti}.pt"
+                if traj_path.exists():
+                    saved = torch.load(traj_path, map_location="cpu", weights_only=False)
+                    rows.append(saved["row"])
+                    print(json.dumps({"event": "sample_traj_skip", "id": saved["row"].get("id"), "traj_index": ti}), flush=True)
+                    continue
                 g = torch.Generator(device="cpu")
                 g.manual_seed(10_000 + ci * 100 + ti)
+                rng_slot["g"] = g
                 n = int(sample["N"])
                 # t=1 native prior (same SDEs as training), not a deterministic cube.
                 prior = noise.corrupt_fixed_sample(

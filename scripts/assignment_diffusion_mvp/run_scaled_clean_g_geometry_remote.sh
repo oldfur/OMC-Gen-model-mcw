@@ -7,7 +7,7 @@ export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 EXECUTE=false
 SMOKE=false
-STAGE="all"  # dataset|audit|smoke|train|eval|sample|all
+STAGE="all"  # dataset|audit|smoke|train|eval|sample|sample_n150|all
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --execute) EXECUTE=true ;;
@@ -110,6 +110,25 @@ run_arm () {
       --output-dir "$out" "${MG[@]}" --execute
   fi
 }
+
+if [[ "$STAGE" == "sample_n150" ]]; then
+  N150="outputs/assignment_diffusion_mvp/scaled_clean_g_geometry_n150"
+  mkdir -p "$N150/original" "$N150/clean_g"
+  for arm in original clean_g; do
+    ckpt="$BASE/$arm/final_checkpoint.pt"
+    [[ -f "$ckpt" ]] || { echo "missing checkpoint $ckpt" >&2; exit 1; }
+    echo "[sample_n150 $arm] ckpt=$ckpt"
+    python scripts/assignment_diffusion_mvp/sample_scaled_clean_g_geometry.py \
+      --config "$CFG" --checkpoint "$ckpt" --ablation-arm "$arm" \
+      --output-dir "$N150/$arm" --n-crystals 150 --n-traj-per-crystal 2 \
+      "${MG[@]}" --execute
+  done
+  python scripts/assignment_diffusion_mvp/compare_scaled_clean_g_geometry.py \
+    --original "$N150/original" --clean-g "$N150/clean_g" \
+    --out "$N150/comparison.json"
+  echo "DONE sample_n150 → $N150"
+  exit 0
+fi
 
 if [[ "$STAGE" != "dataset" && "$STAGE" != "smoke" ]]; then
   run_arm original

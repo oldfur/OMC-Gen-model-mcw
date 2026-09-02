@@ -42,6 +42,47 @@ def _median(xs):
     return xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
 
 
+def _sampling_verdict(paired, win_rate):
+    """robust positive / preliminary only / no robust gain on the three headline metrics."""
+
+    def ci(key):
+        p = (paired or {}).get(key) or {}
+        return p.get("ci95") or {}
+
+    def wr(key):
+        v = (win_rate or {}).get(key)
+        return None if v is None else float(v)
+
+    clash_ci, traj_ci, inter_ci = ci("d_E_clash"), ci("d_traj_E_clash"), ci("d_inter_min")
+    clash_ok = clash_ci.get("high") is not None and clash_ci["high"] < 0
+    traj_ok = traj_ci.get("high") is not None and traj_ci["high"] < 0
+    inter_ok = inter_ci.get("low") is not None and inter_ci["low"] > 0
+    wr_ok = all((wr(k) or 0) > 0.5 for k in ("d_E_clash", "d_traj_E_clash", "d_inter_min"))
+    if clash_ok and traj_ok and inter_ok and wr_ok:
+        label = "robust positive"
+        text = (
+            "Exact clean assignment produces a small but robust improvement "
+            "in reverse intermolecular packing dynamics."
+        )
+    elif clash_ok or traj_ok or inter_ok:
+        label = "preliminary only"
+        text = (
+            "Packing deltas are mixed or only a subset of the three headline "
+            "CIs exclude 0; treat the smaller-N positive result as preliminary."
+        )
+    else:
+        label = "no robust gain"
+        text = "Headline packing CIs include 0; no robust Clean-G sampling gain."
+    return {
+        "label": label,
+        "text": text,
+        "final_E_clash_ci_excludes_0_better": clash_ok,
+        "traj_mean_E_clash_ci_excludes_0_better": traj_ok,
+        "inter_copy_min_ci_excludes_0_better": inter_ok,
+        "win_rate_all_gt_50": wr_ok,
+    }
+
+
 def _bootstrap_ci(xs, *, n_boot=1000, seed=17):
     xs = [float(x) for x in xs if x is not None and x == x]
     if not xs:
@@ -90,6 +131,7 @@ def main() -> None:
         ("d_E_clash", "final_E_clash", "lower"),
         ("d_inter_min", "final_inter_copy_min_dist", "higher"),
         ("d_inter_p5", "final_inter_copy_p5", "higher"),
+        ("d_inter_p10", "final_inter_copy_p10", "higher"),
         ("d_overlap", "final_copy_overlap_max", "lower"),
         ("d_com_min", "final_copy_com_min", "higher"),
         ("d_radius", "final_copy_radius_mean", "either"),
@@ -100,6 +142,11 @@ def main() -> None:
         ("d_traj_inter_min", "traj_mean_inter_copy_min_dist", "higher"),
         ("d_traj_overlap", "traj_mean_copy_overlap_max", "lower"),
         ("d_traj_com", "traj_mean_copy_com_min", "higher"),
+        ("d_no_clash", "no_clash", "higher"),
+        ("d_pass_basic", "pass_basic", "higher"),
+        ("d_valid_cell", "valid_cell", "higher"),
+        ("d_density_ratio", "density_ratio", "either"),
+        ("d_volume_ratio", "volume_ratio", "either"),
     ]
 
     cmap = {(r["id"], r["traj_index"]): r for r in csamp}
@@ -208,6 +255,21 @@ def main() -> None:
         "diagnosis": diagnosis,
         "diagnosis_text": text,
         "convergence_clean_g": conv_c,
+        "sampling_verdict": _sampling_verdict(
+            {
+                k: {
+                    "mean": _mean([d[k] for d in crystals]),
+                    "median": _median([d[k] for d in crystals]),
+                    "ci95": _bootstrap_ci([d[k] for d in crystals]),
+                }
+                for k, _src, _dir in PAIR_KEYS
+            },
+            {
+                dkey: win_rate(dkey, "lower" if direction == "lower" else "higher")
+                for dkey, _src, direction in PAIR_KEYS
+                if direction != "either"
+            },
+        ),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(out, indent=2))
